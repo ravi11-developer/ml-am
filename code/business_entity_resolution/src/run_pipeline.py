@@ -18,11 +18,26 @@ if __name__ == "__main__":
     p.add_argument("--threshold", type=float, default=None)
     p.add_argument("--one-to-one", choices=["auto", "on", "off"], default="auto")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--k-name-pass", type=int, default=0, help="extra name-only retrieval pass, top-k per source (0 = off)")
+    p.add_argument("--k-addr-pass", type=int, default=0, help="extra address-only retrieval pass, top-k per source (0 = off)")
+    p.add_argument("--extra-pool", type=int, default=100, help="retrieval pool of the extra passes")
+    p.add_argument("--indic-translit", action="store_true", help="romanise Indic-script names/addresses")
+    p.add_argument("--name-skeleton", action="store_true", help="add phonetic-skeleton keys to the name block")
+    p.add_argument("--name-clean", action="store_true", help="names: leet digits -> letters, drop web tokens")
+    p.add_argument("--cross-features", action="store_true", help="similarity to the entity's other top candidates")
+    p.add_argument("--skip-test", action="store_true", help="stop after training / validation")
+    p.add_argument("--rounds", type=int, default=1500, help="max LightGBM boosting rounds (early stopping on validation)")
+    p.add_argument("--lr", type=float, default=0.08, help="LightGBM learning rate")
+    p.add_argument("--max-train-rows", type=int, default=3_000_000, help="cap on sampled training pairs")
     a = p.parse_args()
     cfg = Config(data_dir=a.data_dir, output_dir=a.output_dir, model_dir=a.model_dir,
                  train_query_sample=a.train_queries or None, k_per_source=a.k, k_max_per_source=a.k_max,
                  max_posting=a.max_posting, rerank_pool=a.pool, fast_features=a.fast_features, fixed_threshold=a.threshold,
-                 one_to_one=a.one_to_one, seed=a.seed)
+                 one_to_one=a.one_to_one, seed=a.seed, k_name_pass=a.k_name_pass, k_addr_pass=a.k_addr_pass,
+                 extra_pool=a.extra_pool, indic_translit=a.indic_translit, name_skeleton=a.name_skeleton,
+                 name_clean=a.name_clean, cross_features=a.cross_features, skip_test=a.skip_test)
+    cfg.num_boost_round, cfg.max_train_rows = a.rounds, a.max_train_rows
+    cfg.lgb_params = dict(cfg.lgb_params, learning_rate=a.lr)
     if a.threads:
         cfg.n_threads = a.threads
     run(cfg)

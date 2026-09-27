@@ -62,6 +62,15 @@ class Config:
     rerank_pool: int = 100            # retrieve this many per source with the pruned index, re-rank by full cosine
     query_chunk: int = 50_000
     cost_budget: int = 40_000_000     # scipy fallback: max multiply-adds per chunk (bounds memory)
+    k_name_pass: int = 0              # extra name-only retrieval pass: top-k per source by name cosine (0 = off)
+    k_addr_pass: int = 0              # extra address-only retrieval pass: top-k per source by address cosine (0 = off)
+    extra_pool: int = 100             # retrieval pool of the extra passes
+    indic_translit: bool = False      # romanise Indic-script text (Unicode character names, stdlib only)
+    name_skeleton: bool = False       # add a phonetic-skeleton key segment to the name block
+    name_clean: bool = False          # names: leet digits -> letters (b1ack -> black), drop web tokens (com, www)
+    cross_features: bool = False      # similarity of each candidate to the entity's other top candidates (anchors)
+    n_anchors: int = 5
+    skip_test: bool = False           # stop after training / validation (quick model checks)
 
     # ---- training ----
     train_query_sample: int | None = 200_000   # S1 train entities used as queries (None = all)
@@ -118,6 +127,90 @@ LEGAL = {
     "lp", "pc", "pllc", "gmbh", "sa", "sas", "sasu", "sarl", "eurl", "snc", "the", "and",
     "of", "opc", "ltda",
 }
+WEB_TOKENS = {"com", "www", "http", "https", "net", "org"}
+_LEET = str.maketrans("01345678", "oleasgtb")
+_LEET_RE = re.compile(r"(?=(?:.*[a-z]){3})(?!(?:.*\d){3})[a-z0-9]+")
+
+
+def _clean_name_token(v: str) -> str:
+    if v in WEB_TOKENS:
+        return ""
+    if not v.isalpha() and not v.isdigit() and _LEET_RE.fullmatch(v):
+        v = v.translate(_LEET)
+    return ABBREV.get(v, v)
+
+
+def _indic_table() -> dict:
+    """str.translate table romanising Indic scripts (U+0900-U+0DFF) from Unicode character names.
+    Consonants carry an inherent 'a'; vowel signs / virama emit a \\x01 marker that deletes the
+    preceding inherent 'a' (see _translit_indic)."""
+    import unicodedata
+    vowels = {"A": "a", "AA": "aa", "I": "i", "II": "ii", "U": "u", "UU": "uu", "E": "e", "EE": "ee", "AI": "ai",
+              "O": "o", "OO": "oo", "AU": "au", "VOCALIC R": "ri", "VOCALIC RR": "ri", "VOCALIC L": "li",
+              "VOCALIC LL": "li", "SHORT E": "e", "SHORT O": "o", "CANDRA E": "e", "CANDRA O": "o", "SHORT A": "a"}
+    tab = {0x200C: "", 0x200D: ""}
+    for cp in range(0x0900, 0x0E00):
+        try:
+            nm = unicodedata.name(chr(cp))
+        except ValueError:
+            continue
+        rest = nm.split(" ", 1)[1] if " " in nm else nm
+        if rest.startswith("LETTER "):
+            x = rest[7:]
+            if x in vowels:
+                tab[cp] = vowels[x]
+            elif x.startswith("CHILLU "):
+                tab[cp] = x[7:].lower()
+            else:
+                tab[cp] = x.lower().replace(" ", "")      # consonant + inherent a ('KHA' -> 'kha')
+        elif rest.startswith("VOWEL SIGN "):
+            tab[cp] = "\x01" + vowels.get(rest[11:], rest[11:].lower().replace(" ", ""))
+        elif rest.endswith("SIGN VIRAMA"):
+            tab[cp] = "\x01"
+        elif rest.endswith(("ANUSVARA", "CANDRABINDU")):
+            tab[cp] = "n"
+        elif rest.endswith("VISARGA"):
+            tab[cp] = "h"
+        elif rest.startswith("DIGIT "):
+            tab[cp] = str(unicodedata.digit(chr(cp)))
+        elif "LENGTH MARK" in rest or rest.endswith(("NUKTA", "AVAGRAHA")):
+            tab[cp] = ""
+        else:
+            tab[cp] = " "
+    return tab
+
+
+_INDIC_RE = "[\u0900-\u0DFF]"
+
+
+def _translit_indic(a: pa.Array) -> pa.Array:
+    mask = pc.match_substring_regex(a, _INDIC_RE)
+    idx = np.flatnonzero(mask.to_numpy(zero_copy_only=False))
+    if not len(idx):
+        return a
+    tab = _indic_table()
+    vals = [s.translate(tab).replace("a\x01", "").replace("\x01", "") for s in a.take(pa.array(idx)).to_pylist()]
+    log(f"  romanised {len(idx):,} Indic-script values")
+    return pc.replace_with_mask(a, mask, pa.array(vals, pa.large_string()))
+
+
+_SKEL_SUBS = [("x", "ks"), ("ph", "f"), ("sh", "s"), ("ch", "k"), ("ck", "k"), ("ce", "se"), ("ci", "si"), ("q", "k"), ("c", "k"), ("z", "s"),
+              ("w", "v"), ("y", "i"), ("d", "t"), ("b", "p"), ("g", "k"), ("j", "k")]
+_SKEL_H = re.compile(r"(?<=.)h")
+_SKEL_V = re.compile(r"(?<=.)[aeiou]")
+_SKEL_DUP = re.compile(r"(.)\1+")
+
+
+def skeleton(w: str) -> str:
+    """Transliteration-insensitive phonetic key of one token ('' = no key)."""
+    if len(w) < 2 or not w.isalpha():
+        return ""
+    for a_, b_ in _SKEL_SUBS:
+        w = w.replace(a_, b_)
+    w = _SKEL_DUP.sub(r"\1", _SKEL_V.sub("", _SKEL_H.sub("", w)))
+    return w if len(w) >= 2 else ""
+
+
 _POSTAL_RE = re.compile(r"\d{5,6}")
 _HOUSE_RE = re.compile(r"\d+[a-z]?")
 
@@ -160,7 +253,9 @@ def _tokens(norm: pa.Array, mapping: dict | None):
     par = pc.list_parent_indices(L).to_numpy().astype(np.int32)
     enc = pc.dictionary_encode(pc.list_flatten(L))
     vocab = enc.dictionary.to_pylist()
-    if mapping:
+    if callable(mapping):
+        vocab = [mapping(v) for v in vocab]
+    elif mapping:
         vocab = [mapping.get(v, v) for v in vocab]
     new_codes, uniq = pd.factorize(np.array(vocab, dtype=object))
     codes = new_codes[enc.indices.to_numpy()].astype(np.int32)
@@ -182,7 +277,9 @@ def _rejoin(codes, par, vocab_arrow, n) -> pa.Array:
 
 
 def _csr_binary(codes, par, n, ncols):
-    X = sp.csr_matrix((np.ones(len(codes), np.float32), codes, _offsets(par, n)), shape=(n, ncols))
+    # copy: csr_matrix keeps a reference to `codes` and sum_duplicates() sorts/compacts it in place,
+    # which would shift every later token onto the wrong row for all callers that reuse `codes`
+    X = sp.csr_matrix((np.ones(len(codes), np.float32), codes.copy(), _offsets(par, n)), shape=(n, ncols))
     X.sum_duplicates()
     X.data[:] = 1.0
     return X
@@ -217,19 +314,33 @@ def _last_per_row(pos_mask, codes, par, n):
     return out
 
 
-def build_field(raw: pa.Array, n: int, kind: str) -> dict:
+def build_field(raw: pa.Array, n: int, kind: str, cfg: Config | None = None) -> dict:
     """Tokenise one text field for all records; return its TF-IDF block and helpers."""
+    cfg = cfg or Config()
+    if cfg.indic_translit:
+        raw = _translit_indic(raw)
     norm = normalize(raw, is_addr=(kind == "addr"))
-    codes, par, vocab = _tokens(norm, ABBREV)
+    codes, par, vocab = _tokens(norm, _clean_name_token if (kind == "name" and cfg.name_clean) else ABBREV)
     V = len(vocab)
     vocab_arrow = pa.array(vocab.tolist(), pa.large_string())
     U = _csr_binary(codes, par, n, V)
     bc, bp, nb = _bigrams(codes, par, V)
     Bg = _csr_binary(bc, bp, n, nb)
-    out = {"n_uni": V, "n_bi": nb, "u_cnt": np.diff(U.indptr).astype(np.int32),
-           "b_cnt": np.diff(Bg.indptr).astype(np.int32)}
-    X = sp.hstack([U, Bg], format="csr", dtype=np.float32)
-    del U, Bg, bc, bp
+    out = {"n_uni": V, "n_bi": nb, "seg_sizes": [V, nb],
+           "cnts": [np.diff(U.indptr).astype(np.int32), np.diff(Bg.indptr).astype(np.int32)]}
+    blocks = [U, Bg]
+    if kind == "name" and cfg.name_skeleton:
+        sk_codes, sk_vocab = pd.factorize(np.array([skeleton(v) for v in vocab], dtype=object))
+        sk_empty = np.flatnonzero(np.asarray(sk_vocab, dtype=object) == "")
+        sc = sk_codes[codes]
+        keep = sc != (sk_empty[0] if len(sk_empty) else -1)
+        S = _csr_binary(sc[keep].astype(np.int32), par[keep], n, len(sk_vocab))
+        out["seg_sizes"].append(len(sk_vocab))
+        out["cnts"].append(np.diff(S.indptr).astype(np.int32))
+        blocks.append(S)
+        log(f"  name skeleton keys: {len(sk_vocab):,}")
+    X = sp.hstack(blocks, format="csr", dtype=np.float32)
+    del U, Bg, bc, bp, blocks
     out["X"] = _tfidf_rows(X)
     out["text"] = _rejoin(codes, par, vocab_arrow, n)
     out["len"] = pc.utf8_length(out["text"]).to_numpy(zero_copy_only=False).astype(np.int32)
@@ -276,6 +387,7 @@ class Split:
     house: np.ndarray
     first: np.ndarray
     country_labels: np.ndarray
+    n_name_seg: int = 2              # number of name segments at the start of M (the rest is address)
     gt_q: np.ndarray | None = None   # ground-truth pairs as (S1 row, T row)
     gt_t: np.ndarray | None = None
 
@@ -290,23 +402,23 @@ def prepare_split(cfg: Config, split: str) -> Split:
     ids = pc.utf8_trim_whitespace(cat("entity_id"))
     name_raw, addr_raw, ctry_raw = cat("business_name"), cat("business_address"), cat("country")
     del tabs
-    nf = build_field(name_raw, n, "name"); del name_raw
+    nf = build_field(name_raw, n, "name", cfg); del name_raw
     log(f"[{split}] name field: {nf['n_uni']:,} words, {nf['n_bi']:,} bigrams")
-    af = build_field(addr_raw, n, "addr"); del addr_raw
+    af = build_field(addr_raw, n, "addr", cfg); del addr_raw
     log(f"[{split}] addr field: {af['n_uni']:,} words, {af['n_bi']:,} bigrams")
     w = cfg.name_weight
     M = sp.hstack([nf.pop("X") * np.float32(math.sqrt(w)), af.pop("X") * np.float32(math.sqrt(1 - w))],
                   format="csr", dtype=np.float32)
-    bounds = np.cumsum([0, nf["n_uni"], nf["n_bi"], af["n_uni"], af["n_bi"]])
+    bounds = np.cumsum([0] + nf["seg_sizes"] + af["seg_sizes"])
     cn = pc.dictionary_encode(normalize(ctry_raw))
     labels = np.asarray(cn.dictionary.to_pylist(), dtype=object)
     country = cn.indices.to_numpy().astype(np.int32)
     if (labels == "").any():
         country[country == np.flatnonzero(labels == "")[0]] = -1
     D = Split(split, n1, n2 + n3, ids, np.r_[np.zeros(n2, np.int8), np.ones(n3, np.int8)], M, bounds,
-              np.column_stack([nf["u_cnt"], nf["b_cnt"], af["u_cnt"], af["b_cnt"]]),
+              np.column_stack(nf["cnts"] + af["cnts"]),
               nf["text"], nf["core"], af["text"], nf["len"], af["len"], country,
-              af["postal"], af["house"], nf["first"], labels)
+              af["postal"], af["house"], nf["first"], labels, len(nf["seg_sizes"]))
     gt_path = d / f"{split}_ground_truth.tsv"
     if gt_path.exists():
         g = read_tsv(gt_path)
@@ -385,11 +497,39 @@ def _retrieve(Qc: sp.csr_matrix, BT: sp.csr_matrix, dfp: np.ndarray, pool: int, 
     return (np.concatenate(rs), np.concatenate(cs)) if rs else (np.array([], int), np.array([], int))
 
 
-def search_source(D: Split, q_rows: np.ndarray, src: int, k: int, cfg: Config):
-    """Pruned inverted-index retrieval of a wide pool, then exact re-rank by full cosine -> top-k."""
+def rowwise_dot_parts(M: sp.csr_matrix, ia: np.ndarray, ib: np.ndarray, split_col: int, batch: int = 500_000):
+    """Full cosine contributions of the columns < split_col (name) and >= split_col (address)."""
+    nm = np.empty(len(ia), np.float32)
+    ad = np.empty(len(ia), np.float32)
+    for s in range(0, len(ia), batch):
+        P = M[ia[s:s + batch]].multiply(M[ib[s:s + batch]]).tocsr()
+        rows = np.repeat(np.arange(P.shape[0]), np.diff(P.indptr))
+        is_n = P.indices < split_col
+        nm[s:s + batch] = np.bincount(rows[is_n], weights=P.data[is_n], minlength=P.shape[0])
+        ad[s:s + batch] = np.bincount(rows[~is_n], weights=P.data[~is_n], minlength=P.shape[0])
+    return nm, ad
+
+
+def _mask_cols(X: sp.csr_matrix, keep_lo: int, keep_hi: int) -> sp.csr_matrix:
+    X.data[(X.indices < keep_lo) | (X.indices >= keep_hi)] = 0
+    X.eliminate_zeros()
+    return X
+
+
+PASSES = {"all": 1, "name": 2, "addr": 4}
+
+
+def search_source(D: Split, q_rows: np.ndarray, src: int, k: int, cfg: Config, part: str = "all"):
+    """Pruned inverted-index retrieval of a wide pool, then exact re-rank -> top-k.
+    part='all' ranks by the full (name+address) cosine; 'name' / 'addr' retrieve and rank using only
+    that field's columns. Returns (q, t, full cosine, rank within this pass)."""
     t_rows = np.flatnonzero(D.src == src).astype(np.int32)
+    split_col = int(D.bounds[D.n_name_seg])
+    lo, hi = {"all": (0, D.M.shape[1]), "name": (0, split_col), "addr": (split_col, D.M.shape[1])}[part]
     Q = D.M[q_rows]
     B = D.M[D.n1 + t_rows]
+    if part != "all":
+        Q, B = _mask_cols(Q, lo, hi), _mask_cols(B, lo, hi)
     df = np.bincount(B.indices, minlength=B.shape[1])
     B.data[df[B.indices] > cfg.max_posting] = 0
     B.eliminate_zeros()
@@ -397,20 +537,44 @@ def search_source(D: Split, q_rows: np.ndarray, src: int, k: int, cfg: Config):
     cost = int(dfp[Q.indices].sum())
     BT = B.T.tocsr()
     del B
-    pool = max(k, cfg.rerank_pool)
+    pool = max(k, cfg.rerank_pool if part == "all" else cfg.extra_pool)
     t0 = time.time()
-    qs, ts, ss = [], [], []
+    qs, ts, ss, rs = [], [], [], []
     for s in range(0, len(q_rows), cfg.query_chunk):
         r, c = _retrieve(Q[s:s + cfg.query_chunk], BT, dfp, pool, cfg)
         qq, tt = q_rows[s + r], t_rows[c]
-        sc = rowwise_dot(D.M, qq, D.n1 + tt)
-        rk, _ = _ranks(qq.astype(np.int64), sc)
-        m = (rk <= k) & (sc > 0)
-        qs.append(qq[m]); ts.append(tt[m]); ss.append(sc[m])
-    log(f"  S{src + 2}: {len(q_rows):,} queries x {len(t_rows):,} targets, {cost / 1e9:.2f}G index ops, "
+        nm, ad = rowwise_dot_parts(D.M, qq, D.n1 + tt, split_col)
+        full = nm + ad
+        ps = {"all": full, "name": nm, "addr": ad}[part]
+        rk, _ = _ranks(qq.astype(np.int64), ps)
+        m = (rk <= k) & (ps > 0)
+        qs.append(qq[m]); ts.append(tt[m]); ss.append(full[m]); rs.append(rk[m])
+    del Q, BT
+    log(f"  S{src + 2} [{part}]: {len(q_rows):,} queries x {len(t_rows):,} targets, {cost / 1e9:.2f}G index ops, "
         f"pool {pool} -> top {k}: {time.time() - t0:.0f}s")
     return (np.concatenate(qs).astype(np.int32), np.concatenate(ts).astype(np.int32),
-            np.concatenate(ss).astype(np.float32))
+            np.concatenate(ss).astype(np.float32), np.concatenate(rs).astype(np.float32))
+
+
+def _union_passes(runs: list, nT: int) -> dict:
+    """Union (q, t) pairs over passes: OR of pass bits, min rank per pass (NaN = not retrieved).
+    runs: list of (q, t, full score, pass rank, pass name)."""
+    key = np.concatenate([r[0].astype(np.int64) * nT + r[1] for r in runs])
+    order = np.argsort(key, kind="stable")
+    key = key[order]
+    starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
+    out = {"q": (key[starts] // nT).astype(np.int32), "t": (key[starts] % nT).astype(np.int32)}
+    del key
+    out["block_score"] = np.concatenate([r[2] for r in runs])[order][starts]
+    bits = np.concatenate([np.full(len(r[0]), PASSES[r[4]], np.int8) for r in runs])[order]
+    out["pass"] = np.bitwise_or.reduceat(bits, starts).astype(np.int8)
+    del bits
+    for name, bit in PASSES.items():
+        rk = np.concatenate([r[3] if PASSES[r[4]] == bit else np.full(len(r[0]), np.inf, np.float32)
+                             for r in runs])[order]
+        v = np.minimum.reduceat(rk, starts)
+        out[f"pass_rank_{name}"] = np.where(np.isinf(v), np.nan, v).astype(np.float32)
+    return out
 
 
 def _ranks(keys_major: np.ndarray, score: np.ndarray):
@@ -437,21 +601,36 @@ def add_group_features(C: pd.DataFrame) -> pd.DataFrame:
 
 
 def generate_candidates(D: Split, q_rows: np.ndarray, k: int, cfg: Config) -> pd.DataFrame:
+    """Per source: combined-cosine pass (top k) + optional name-only / address-only passes, unioned."""
     t0 = time.time()
     parts = []
+    passes = [("all", k), ("name", cfg.k_name_pass), ("addr", cfg.k_addr_pass)]
     for src in (0, 1):
-        q, t, s = search_source(D, q_rows, src, k, cfg)
-        parts.append(pd.DataFrame({"q": q, "t": t, "src": np.int8(src), "block_score": s}))
+        runs = []
+        for part, kk in passes:
+            if kk > 0:
+                runs.append(search_source(D, q_rows, src, kk, cfg, part) + (part,))
+                gc.collect()
+        U = _union_passes(runs, D.nT)
+        del runs
+        parts.append(pd.DataFrame({"src": np.int8(src), **U}))
+        del U
         gc.collect()
     C = pd.concat(parts, ignore_index=True)
+    del parts
     C = add_group_features(C)
     log(f"[{D.name}] candidates: {len(C):,} ({len(C) / max(len(q_rows), 1):.1f} per S1) in {time.time() - t0:.0f}s")
     return C
 
 
 def truncate_k(C: pd.DataFrame, k: int) -> pd.DataFrame:
-    C = C[C["rank_in_source"] <= k].drop(columns=["rank_in_source", "rank_overall", "gap_to_best",
-                                                  "ratio_to_best", "n_cand_s1"]).reset_index(drop=True)
+    """Keep the top k of the combined pass; candidates of the extra passes are kept as they are."""
+    keep = (C["pass_rank_all"] <= k) | C["pass_rank_name"].notna() | C["pass_rank_addr"].notna()
+    C = C[keep.to_numpy()].drop(columns=["rank_in_source", "rank_overall", "gap_to_best",
+                                         "ratio_to_best", "n_cand_s1"]).reset_index(drop=True)
+    C.loc[C["pass_rank_all"] > k, "pass_rank_all"] = np.nan
+    C["pass"] = ((C["pass_rank_all"].notna().to_numpy() * 1) | (C["pass_rank_name"].notna().to_numpy() * 2)
+                 | (C["pass_rank_addr"].notna().to_numpy() * 4)).astype(np.int8)
     return add_group_features(C)
 
 
@@ -470,12 +649,16 @@ def label_pairs(D: Split, q: np.ndarray, t: np.ndarray) -> np.ndarray:
 def choose_k(C: pd.DataFrame, D: Split, q_rows: np.ndarray, cfg: Config) -> int:
     in_q = np.isin(D.gt_q, q_rows)
     total = int(in_q.sum())
-    pr = C.loc[C["label"] == 1, "rank_in_source"].to_numpy()
+    pr = C.loc[C["label"] == 1, "pass_rank_all"].fillna(np.inf).to_numpy()
     curve = {k: float((pr <= k).sum() / max(total, 1)) for k in range(1, cfg.k_max_per_source + 1)}
     top = curve[cfg.k_max_per_source]
     k = next(k for k, r in curve.items() if r >= cfg.recall_keep * top)
     log("  recall@K: " + "  ".join(f"{k}:{r:.4f}" for k, r in curve.items() if k in (1, 2, 3, 5, 8, 10, 15, 20) or k == cfg.k_max_per_source))
     log(f"  chosen K per source = {k} (recall {curve[k]:.4f} vs {top:.4f} at K={cfg.k_max_per_source})")
+    lab = C["label"].to_numpy() == 1
+    extra = C["pass_rank_name"].notna().to_numpy() | C["pass_rank_addr"].notna().to_numpy()
+    log(f"  union recall with extra passes (K={k}): "
+        f"{((lab & ((C['pass_rank_all'].to_numpy() <= k) | extra)).sum()) / max(total, 1):.4f}")
     return k
 
 
@@ -511,12 +694,69 @@ BASE_FEATURES = [
     "name_token_sort", "name_core_ratio", "first_token_match", "addr_token_set",
     "postal_match", "house_match", "name_len_s1", "name_len_t", "addr_len_s1", "addr_len_t",
     "is_s3", "rank_in_source", "rank_overall", "gap_to_best", "ratio_to_best", "n_cand_s1",
+    "pass_rank_all", "pass_rank_name", "pass_rank_addr", "name_skel_jaccard",
 ]
 SLOW_FEATURES = ["name_token_set", "name_partial", "addr_levenshtein_ratio"]
+CROSS_FEATURES = ["cross_max_full", "cross_mean_full", "cross_max_name", "cross_max_addr", "cross_cnt_05",
+                  "cross_is_anchor", "cross_top_name_set", "cross_top_addr_set"]
 
 
 def feature_names(cfg: Config) -> list:
-    return BASE_FEATURES + ([] if cfg.fast_features else SLOW_FEATURES)
+    return (BASE_FEATURES + ([] if cfg.fast_features else SLOW_FEATURES)
+            + (CROSS_FEATURES if cfg.cross_features else []))
+
+
+def compute_anchors(C: pd.DataFrame, n1: int, n_anchors: int) -> np.ndarray:
+    """(n1, n_anchors) target rows of each S1's best candidates by block score (-1 = none). Must be
+    computed on the full candidate set (before any negative sampling) so train and test agree."""
+    q, t, sc = C["q"].to_numpy(), C["t"].to_numpy(), C["block_score"].to_numpy()
+    order = np.lexsort((-sc, q))
+    qs = q[order]
+    start = np.r_[True, qs[1:] != qs[:-1]]
+    gstart = np.maximum.accumulate(np.where(start, np.arange(len(qs)), 0))
+    rank = np.arange(len(qs)) - gstart
+    A = np.full((n1, n_anchors), -1, np.int32)
+    m = rank < n_anchors
+    A[qs[m], rank[m]] = t[order][m]
+    return A
+
+
+def cross_features(D: Split, q: np.ndarray, t: np.ndarray, cfg: Config, wk: int) -> dict:
+    """Agreement of candidate t with the other top candidates of the same S1 (S2/S3 copies of one
+    business tend to agree with each other even when the S1 record is noisy)."""
+    A = D.anchors[q]
+    m, k = A.shape
+    full = np.full((m, k), np.nan, np.float32)
+    nmx = np.full((m, k), np.nan, np.float32)
+    adx = np.full((m, k), np.nan, np.float32)
+    split_col = int(D.bounds[D.n_name_seg])
+    for j in range(k):
+        a = A[:, j]
+        v = np.flatnonzero((a >= 0) & (a != t))
+        if len(v):
+            nm, ad = rowwise_dot_parts(D.M, D.n1 + t[v], D.n1 + a[v], split_col)
+            full[v, j], nmx[v, j], adx[v, j] = nm + ad, nm / cfg.name_weight, ad / (1 - cfg.name_weight)
+    F = {}
+    with np.errstate(all="ignore"):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            F["cross_max_full"] = np.nanmax(full, 1)
+            F["cross_mean_full"] = np.nanmean(full, 1)
+            F["cross_max_name"] = np.nanmax(nmx, 1)
+            F["cross_max_addr"] = np.nanmax(adx, 1)
+    F["cross_cnt_05"] = (np.nan_to_num(full) > 0.5).sum(1).astype(np.float32)
+    F["cross_is_anchor"] = (A == t[:, None]).any(1).astype(np.float32)
+    # string similarity to the best other anchor
+    best = np.where(A[:, 0] != t, A[:, 0], A[:, 1] if k > 1 else -1)
+    has = best >= 0
+    tn, bn = np.full(m, np.nan, np.float32), np.full(m, np.nan, np.float32)
+    if has.any():
+        it, ia = pa.array(D.n1 + t[has]), pa.array(D.n1 + best[has])
+        tn[has] = _cp(D.name_text.take(it).to_pylist(), D.name_text.take(ia).to_pylist(), fuzz.token_set_ratio, wk)
+        bn[has] = _cp(D.addr_text.take(it).to_pylist(), D.addr_text.take(ia).to_pylist(), fuzz.token_set_ratio, wk)
+    F["cross_top_name_set"], F["cross_top_addr_set"] = tn, bn
+    return {c: v.astype(np.float32) for c, v in F.items()}
 
 
 def _cp(a, b, scorer, workers):
@@ -538,20 +778,22 @@ def pair_features(D: Split, C: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     F = {}
     P = D.M[q].multiply(D.M[ib]).tocsr()
     rows = np.repeat(np.arange(m), np.diff(P.indptr))
+    ns, nn = len(D.bounds) - 1, D.n_name_seg
     seg = np.searchsorted(D.bounds, P.indices, side="right") - 1
-    key = rows * 4 + seg
-    sums = np.bincount(key, weights=P.data, minlength=4 * m).reshape(m, 4)
-    inter = np.bincount(key, minlength=4 * m).reshape(m, 4).astype(np.float32)
+    key = rows * ns + seg
+    sums = np.bincount(key, weights=P.data, minlength=ns * m).reshape(m, ns)
+    inter = np.bincount(key, minlength=ns * m).reshape(m, ns).astype(np.float32)
     del P, rows, seg, key
     union = D.seg_cnt[q] + D.seg_cnt[ib] - inter
     with np.errstate(divide="ignore", invalid="ignore"):
         jac = np.where(union > 0, inter / union, np.nan).astype(np.float32)
     w = cfg.name_weight
-    F["name_tfidf_cos"] = ((sums[:, 0] + sums[:, 1]) / w).astype(np.float32)
-    F["addr_tfidf_cos"] = ((sums[:, 2] + sums[:, 3]) / (1 - w)).astype(np.float32)
+    F["name_tfidf_cos"] = (sums[:, :nn].sum(1) / w).astype(np.float32)
+    F["addr_tfidf_cos"] = (sums[:, nn:].sum(1) / (1 - w)).astype(np.float32)
     F["tfidf_cosine_score"] = (sums.sum(1)).astype(np.float32)
     F["name_jaccard"], F["name_bigram_jaccard"] = jac[:, 0], jac[:, 1]
-    F["address_jaccard"], F["addr_bigram_jaccard"] = jac[:, 2], jac[:, 3]
+    F["address_jaccard"], F["addr_bigram_jaccard"] = jac[:, nn], jac[:, nn + 1]
+    F["name_skel_jaccard"] = jac[:, 2] if nn > 2 else np.full(m, np.nan, np.float32)
     F["country_match"] = _agree(D.country[q], D.country[ib])
     F["postal_match"] = _agree(D.postal[q], D.postal[ib])
     F["house_match"] = _agree(D.house[q], D.house[ib])
@@ -574,8 +816,11 @@ def pair_features(D: Split, C: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         F["addr_levenshtein_ratio"] = _cp(a1, a2, _lev, wk)
     del a1, a2
     F["is_s3"] = C["src"].to_numpy().astype(np.float32)
-    for c in ("block_score", "rank_in_source", "rank_overall", "gap_to_best", "ratio_to_best", "n_cand_s1"):
+    for c in ("block_score", "rank_in_source", "rank_overall", "gap_to_best", "ratio_to_best", "n_cand_s1",
+              "pass_rank_all", "pass_rank_name", "pass_rank_addr"):
         F[c] = C[c].to_numpy().astype(np.float32)
+    if cfg.cross_features:
+        F.update(cross_features(D, q, t, cfg, wk))
     return pd.DataFrame({c: F[c] for c in feature_names(cfg)})
 
 
@@ -642,6 +887,8 @@ def train_and_tune(D: Split, cfg: Config) -> dict:
     k = cfg.k_per_source or choose_k(C, D, q_rows, cfg)
     C = truncate_k(C, k)
     C["label"] = label_pairs(D, C["q"].to_numpy(), C["t"].to_numpy())
+    if cfg.cross_features:
+        D.anchors = compute_anchors(C, D.n1, cfg.n_anchors)
 
     val_q = np.sort(rng.choice(q_rows, int(len(q_rows) * cfg.val_frac), replace=False))
     is_val = np.isin(C["q"].to_numpy(), val_q)
@@ -684,7 +931,8 @@ def train_and_tune(D: Split, cfg: Config) -> dict:
     imp = pd.Series(final.feature_importance("gain"), index=final.feature_name()).sort_values(ascending=False)
     return {"booster": final, "k": int(k), "threshold": float(thr), "one_to_one": bool(one),
             "curve": curve, "report": report, "importance": imp,
-            "val": Cva.assign(prob=prob, label=y.astype(np.int8))}
+            "val": Cva.assign(prob=prob, label=y.astype(np.int8)),
+            "val_gt_cnt": np.c_[val_q, gt_cnt]}
 
 
 # %% [markdown]
@@ -743,8 +991,15 @@ def validate_outputs(match_path: Path, cand_path: Path, D: Split) -> bool:
 def predict_test(res: dict, cfg: Config) -> dict:
     D = prepare_split(cfg, "test")
     C = generate_candidates(D, np.arange(D.n1, dtype=np.int32), res["k"], cfg)
+    if cfg.cross_features:
+        D.anchors = compute_anchors(C, D.n1, cfg.n_anchors)
     prob = features_batched(D, C, cfg, booster=res["booster"], tag="test")
     q, t = C["q"].to_numpy(), C["t"].to_numpy()
+    cache = Path(cfg.model_dir) / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    np.savez(cache / "test_scored.npz", q=q, t=t, prob=prob, block_score=C["block_score"].to_numpy(),
+             src=C["src"].to_numpy())
+    log(f"  cached test candidates + probabilities to {cache}")
     keep = prob >= res["threshold"]
     if res["one_to_one"]:
         keep &= target_best(t, prob)
@@ -772,6 +1027,12 @@ def run(cfg: Config) -> dict:
     (md / "run_report.json").write_text(json.dumps({"config": asdict(cfg), "validation": res["report"]}, indent=2, default=str))
     res["curve"].to_csv(md / "threshold_curve.tsv", sep="\t", index=False)
     res["importance"].rename("gain").to_csv(md / "feature_importance.tsv", sep="\t")
+    (md / "cache").mkdir(exist_ok=True)
+    res["val"][["q", "t", "src", "block_score", "prob", "label"]].to_parquet(md / "cache" / "val_scored.parquet")
+    np.save(md / "cache" / "val_gt_cnt.npy", res["val_gt_cnt"])
+    if cfg.skip_test:
+        log("skip_test: stopping after validation")
+        return {"train_result": res}
     pred = predict_test(res, cfg)
     log("done")
     return {"train_result": res, "pred": pred}
