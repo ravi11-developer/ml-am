@@ -77,6 +77,8 @@ class Config:
     oof_folds: int = 2
     house_fuzzy: bool = False         # house-number agreement tolerant to truncation / zero padding
     target_features: bool = False     # block ALL train S1 (as at test) + target-side competition features
+    addr_numbers: bool = False        # compare all address numbers (exact / truncated-padded / numeric gap -> decoys)
+    sib_features: bool = False        # how many S1 entities share this S1's / this record's canonical name
 
     # ---- training ----
     train_query_sample: int | None = 200_000   # S1 train entities used as queries (None = all)
@@ -378,6 +380,17 @@ def build_field(raw: pa.Array, n: int, kind: str, cfg: Config | None = None) -> 
             firsts = np.r_[True, rows[1:] != rows[:-1]]
             hn[rows[firsts]] = num_val[codes[idx[firsts]]]
         out["house_num"] = hn
+        numv = np.array([int(re.match(r"\d+", v).group()[:9]) if _HOUSE_RE.fullmatch(v) else -1 for v in vocab], np.int64)
+        idx = np.flatnonzero(numv[codes] >= 0)
+        NUM = np.full((n, 6), -1, np.int32)
+        if len(idx):
+            rows = par[idx]
+            st_ = np.r_[True, rows[1:] != rows[:-1]]
+            gs = np.maximum.accumulate(np.where(st_, np.arange(len(idx)), 0))
+            rk = np.arange(len(idx)) - gs
+            kk = rk < 6
+            NUM[rows[kk], rk[kk]] = numv[codes[idx[kk]]]
+        out["nums"] = NUM
     return out
 
 
@@ -434,6 +447,14 @@ def prepare_split(cfg: Config, split: str) -> Split:
               nf["text"], nf["core"], af["text"], nf["len"], af["len"], country,
               af["postal"], af["house"], nf["first"], labels, len(nf["seg_sizes"]))
     D.house_num = af["house_num"]
+    D.nums = af["nums"]
+    if cfg.sib_features:   # canonical name = sorted unique core tokens; count S1 entities per name
+        keys = [" ".join(sorted(set(x.split()))) for x in D.core_text.to_pylist()]
+        kc, _ = pd.factorize(np.array(keys, dtype=object))
+        del keys
+        s1c = np.bincount(kc[:n1], minlength=int(kc.max()) + 1)
+        D.sib = s1c[kc].astype(np.float32)
+        log(f"  S1 entities sharing a canonical name with another S1: {(D.sib[:n1] > 1).mean():.3f}")
     gt_path = d / f"{split}_ground_truth.tsv"
     if gt_path.exists():
         g = read_tsv(gt_path)
@@ -755,6 +776,9 @@ CROSS_FEATURES = ["cross_max_full", "cross_mean_full", "cross_max_name", "cross_
                   "cross_is_anchor", "cross_top_name_set", "cross_top_addr_set"]
 HOUSE_FEATURES = ["house_fuzzy", "house_logdiff"]
 TARGET_FEATURES = ["t_n_s1", "t_rank", "t_gap", "t_ratio", "t_margin"]
+NUM_FEATURES = ["num_n_s1", "num_n_t", "num_exact_frac", "num_trunc_frac", "num_unmatched_s1", "num_first_exact",
+                "num_first_trunc", "num_min_gap", "num_first_min_gap"]
+SIB_FEATURES = ["sib_s1", "sib_t"]
 P1_COLS = ["p1", "p1_rank", "p1_rank_src", "p1_max_other", "p1_second", "p1_sum_other", "p1_cnt05_other",
            "p1_cnt05_other_src", "p1_ratio_best", "p1_gap_best"]
 STAGE2_FEATURES = P1_COLS + ["pc_max_full", "pc_wmean_full", "pc_max_name", "pc_max_addr", "pc_cnt_05",
@@ -765,6 +789,7 @@ def feature_names(cfg: Config, stage: int = 1) -> list:
     return (BASE_FEATURES + ([] if cfg.fast_features else SLOW_FEATURES)
             + (CROSS_FEATURES if cfg.cross_features else []) + (HOUSE_FEATURES if cfg.house_fuzzy else [])
             + (TARGET_FEATURES if cfg.target_features else [])
+            + (NUM_FEATURES if cfg.addr_numbers else []) + (SIB_FEATURES if cfg.sib_features else [])
             + (STAGE2_FEATURES if stage == 2 else []))
 
 
@@ -914,6 +939,38 @@ def house_fuzzy(h1: np.ndarray, h2: np.ndarray):
     return f, d
 
 
+def number_features(A: np.ndarray, B: np.ndarray) -> dict:
+    """A, B: (m, 6) address numbers of S1 / record (-1 = none). True copies keep S1's numbers exactly or
+    as strings (zero padding, one digit truncated); decoys shift them numerically (8 -> 9, 1331 -> 1332)."""
+    va, vb = A >= 0, B >= 0
+    na, nb = va.sum(1), vb.sum(1)
+    Ai, Bi = A[:, :, None].astype(np.int64), B[:, None, :].astype(np.int64)
+    both = va[:, :, None] & vb[:, None, :]
+    eq = both & (Ai == Bi)
+    a, b = np.maximum(Ai, 1), np.maximum(Bi, 1)
+    da = np.floor(np.log10(a)).astype(np.int64) + 1
+    db = np.floor(np.log10(b)).astype(np.int64) + 1
+    one = (np.abs(da - db) == 1) & (np.minimum(da, db) >= 2)
+    suf = (a % (10 ** db) == b) | (b % (10 ** da) == a)
+    pre = ((da > db) & (a // (10 ** np.maximum(da - db, 0)) == b)) | ((db > da) & (b // (10 ** np.maximum(db - da, 0)) == a))
+    tr = both & ~eq & one & (suf | pre)
+    found, trf = eq.any(2), tr.any(2) & ~eq.any(2)
+    open_a = ~(found | trf)[:, :, None]          # numeric gap only for S1 numbers not matched otherwise
+    gap = np.where(both & open_a, np.abs(Ai - Bi), np.iinfo(np.int64).max).astype(np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        F = {"num_n_s1": na.astype(np.float32), "num_n_t": nb.astype(np.float32),
+             "num_exact_frac": np.where(na > 0, found.sum(1) / na, np.nan),
+             "num_trunc_frac": np.where(na > 0, trf.sum(1) / na, np.nan),
+             "num_unmatched_s1": (na - (found | trf).sum(1)).astype(np.float32),
+             "num_first_exact": np.where(na > 0, found[:, 0], np.nan),
+             "num_first_trunc": np.where(na > 0, trf[:, 0], np.nan)}
+        mg = gap.min((1, 2)); fg = gap[:, 0, :].min(1)
+        big = np.iinfo(np.int64).max * 0.5
+        F["num_min_gap"] = np.where(mg < big, np.log1p(mg), np.nan)
+        F["num_first_min_gap"] = np.where(fg < big, np.log1p(fg), np.nan)
+    return {k: np.asarray(v, np.float32) for k, v in F.items()}
+
+
 def pair_features(D: Split, C: pd.DataFrame, cfg: Config, stage: int = 1) -> pd.DataFrame:
     q = C["q"].to_numpy(); t = C["t"].to_numpy(); ib = D.n1 + t; m = len(q)
     F = {}
@@ -967,6 +1024,10 @@ def pair_features(D: Split, C: pd.DataFrame, cfg: Config, stage: int = 1) -> pd.
     if cfg.target_features:
         for c in TARGET_FEATURES:
             F[c] = C[c].to_numpy().astype(np.float32)
+    if cfg.addr_numbers:
+        F.update(number_features(D.nums[q], D.nums[ib]))
+    if cfg.sib_features:
+        F["sib_s1"], F["sib_t"] = D.sib[q], D.sib[ib]
     if stage == 2:
         for c in P1_COLS:
             F[c] = C[c].to_numpy().astype(np.float32)
@@ -1042,13 +1103,18 @@ def train_and_tune(D: Split, cfg: Config) -> dict:
     else:
         k = choose_k(C[np.isin(C["q"].to_numpy(), q_rows)] if cfg.target_features else C, D, q_rows, cfg)
     C = truncate_k(C, k)
+    C_all = None
     if cfg.target_features:
         C = add_target_features(C)
+        C["label"] = label_pairs(D, C["q"].to_numpy(), C["t"].to_numpy())
+        if cfg.cross_features:
+            D.anchors = compute_anchors(C, D.n1, cfg.n_anchors)
+        C_all = C
         C = C[np.isin(C["q"].to_numpy(), q_rows)].reset_index(drop=True)
         gc.collect()
         log(f"  target-side features computed on all S1; kept {len(C):,} candidates of the {len(q_rows):,} sampled S1")
     C["label"] = label_pairs(D, C["q"].to_numpy(), C["t"].to_numpy())
-    if cfg.cross_features:
+    if cfg.cross_features and C_all is None:
         D.anchors = compute_anchors(C, D.n1, cfg.n_anchors)
 
     val_q = np.sort(rng.choice(q_rows, int(len(q_rows) * cfg.val_frac), replace=False))
@@ -1121,6 +1187,34 @@ def train_and_tune(D: Split, cfg: Config) -> dict:
               "val_f05_blocking_ceiling": macro_f05(len(val_q), qi[y], y[y], gt_cnt),
               "val_f05_predict_nothing": macro_f05(len(val_q), qi[:0], y[:0], gt_cnt),
               "val_f05_stage1_best": s1_best, "profile": st}
+    if C_all is not None and not cfg.two_stage:
+        # TEST-LIKE validation: score every S1 competing for the validation records, one-to-one over all
+        TE = np.zeros(D.nT, bool); TE[Cva["t"].to_numpy()] = True
+        P = C_all[TE[C_all["t"].to_numpy()]].reset_index(drop=True)
+        del C_all
+        gc.collect()
+        log(f"  test-like validation: scoring {len(P):,} pairs (validation S1 + all competitors)")
+        P["prob"] = features_batched(D, P, cfg, booster=booster, tag="testlike")
+        pq, pt, pp, py = P["q"].to_numpy(), P["t"].to_numpy(), P["prob"].to_numpy(), P["label"].to_numpy().astype(bool)
+        inV = np.isin(pq, val_q); pqi = np.searchsorted(val_q, pq)
+        ptb = target_best(pt, pp)
+
+        def tl(x):
+            kk = inV & (pp >= x) & ptb
+            return macro_f05(len(val_q), pqi[kk], py[kk], gt_cnt)
+        tcurve = pd.DataFrame({"threshold": cfg.threshold_grid, "testlike_f05": [tl(x) for x in cfg.threshold_grid]})
+        tpl = tcurve.loc[tcurve["testlike_f05"] >= tcurve["testlike_f05"].max() - 5e-4, "threshold"]
+        thr_tl = float(tpl.iloc[len(tpl) // 2])
+        report.update({"testlike_f05_at_val_threshold": tl(thr), "testlike_threshold": thr_tl,
+                       "testlike_f05": tl(thr_tl)})
+        if cfg.fixed_threshold is None:
+            thr = thr_tl
+            report["threshold"] = thr
+        cdir = Path(cfg.model_dir) / "cache"; cdir.mkdir(parents=True, exist_ok=True)
+        P[["q", "t", "src", "block_score", "prob", "label"]].to_parquet(cdir / "testlike_pairs.parquet")
+        np.save(cdir / "testlike_E_gtcnt.npy", np.c_[val_q, gt_cnt])
+        del P
+        gc.collect()
     for kk, v in report.items():
         if kk != "profile":
             log(f"  {kk}: {v:.4f}" if isinstance(v, float) else f"  {kk}: {v}")

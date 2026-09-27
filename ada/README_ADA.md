@@ -31,23 +31,22 @@ tail -f logs/slurm_er_d3_<jobid>.log         # live log; Ctrl+C stops watching, 
 If `sbatch` rejects the job, open `ada/run_d3.sbatch` and uncomment the `-A` (account),
 `-p` (partition) or `--gres=gpu:1` lines as your cluster requires.
 
-Presets:
-- `RUN=D5 PRESET=d5 sbatch ada/run_d3.sbatch`: **max-accuracy**. D4 plus a reverse pass (each S2/S3 record
-  retrieves its top-3 S1 out of all S1) and 255 leaves. About 3–4 h, ~55 GB RAM.
-- `RUN=D4 PRESET=d4 sbatch ada/run_d3.sbatch`: D3 plus blocking of *all* training S1
-  entities (as at test) plus target-side competition features. Needs about 50 GB RAM and 2.5–3 h.
-- `RUN=D3 PRESET=d3 sbatch ada/run_d3.sbatch`: two-stage model and house-number match (about 2–2.5 h).
-- `d4s` / `d3s`: the same with 250k training queries (faster). `d2` reproduces D2.
+Presets (default `RUN=D6 PRESET=d6`):
+- `sbatch ada/run_d3.sbatch`: **final (d6)**. Decoy-aware address-number features, same-name sibling counts,
+  target-side competition over all S1, reverse pass, and a **test-like validation** (every S1 competes, like the
+  leaderboard) that sets the threshold. Afterwards `decide_testlike.py` tunes a margin/cap rule and writes
+  `output/D6_tl`. About 2–2.5 h, ~30 GB.
+- `RUN=D6x PRESET=d6x sbatch ada/run_d3.sbatch`: the same plus cross-candidate features.
+- `RUN=D6s PRESET=d6s sbatch ada/run_d3.sbatch`: 250k queries, address pass 15 (faster).
+- Older presets: d2, d3, d3s, d4, d4s, d5, d5s.
 
-If the cluster lets you run two jobs at once, submit D4 and D3 together; D3 is the fallback.
-
-Useful log lines: `stage-1 best val F0.5` vs `val_f05` (the stage-2 gain), `[test] candidates`,
-`test s2 features`, `VALIDATION PASS`, `done`.
+Useful log lines: `testlike_f05` (the number to trust: it mimics the leaderboard), `[test] candidates`,
+`test features`, `VALIDATION PASS`, `best test-like F0.5 ... (thr, margin, cap)`, `done`.
 
 ## 5. On your laptop: copy the results back (~1.5 GB)
 ```powershell
-scp -r <user>@ada.iiit.ac.in:~/ml-am/output/D3 output/
-scp <user>@ada.iiit.ac.in:~/ml-am/artifacts/D3/run_report.json artifacts/D3_run_report.json
+scp -r <user>@ada.iiit.ac.in:~/ml-am/output/D6_tl output/
+scp <user>@ada.iiit.ac.in:~/ml-am/artifacts/D6/run_report.json artifacts/D6_run_report.json
 ```
-Submit `output/D3` (or `output/D3_ef` if `decision.json` shows a higher `ef_val_f05`) only if its
-`val_f05` beats D2's 0.9537. Otherwise keep D2.
+Submit `output/D6_tl` (tuned decision rule) or `output/D6`. Its `testlike_f05` is the leaderboard estimate;
+D1 scored 0.936 on the leaderboard and remains the fallback.
