@@ -65,6 +65,8 @@ class Config:
     k_name_pass: int = 0              # extra name-only retrieval pass: top-k per source by name cosine (0 = off)
     k_addr_pass: int = 0              # extra address-only retrieval pass: top-k per source by address cosine (0 = off)
     extra_pool: int = 100             # retrieval pool of the extra passes
+    k_rev_pass: int = 0               # reverse pass: every S2/S3 record retrieves its top-k S1 (index = ALL S1)
+    rev_pool: int = 30                # retrieval pool of the reverse pass
     indic_translit: bool = False      # romanise Indic-script text (Unicode character names, stdlib only)
     name_skeleton: bool = False       # add a phonetic-skeleton key segment to the name block
     name_clean: bool = False          # names: leet digits -> letters (b1ack -> black), drop web tokens (com, www)
@@ -529,7 +531,7 @@ def _mask_cols(X: sp.csr_matrix, keep_lo: int, keep_hi: int) -> sp.csr_matrix:
     return X
 
 
-PASSES = {"all": 1, "name": 2, "addr": 4}
+PASSES = {"all": 1, "name": 2, "addr": 4, "rev": 8}
 
 
 def search_source(D: Split, q_rows: np.ndarray, src: int, k: int, cfg: Config, part: str = "all"):
@@ -565,6 +567,38 @@ def search_source(D: Split, q_rows: np.ndarray, src: int, k: int, cfg: Config, p
     del Q, BT
     log(f"  S{src + 2} [{part}]: {len(q_rows):,} queries x {len(t_rows):,} targets, {cost / 1e9:.2f}G index ops, "
         f"pool {pool} -> top {k}: {time.time() - t0:.0f}s")
+    return (np.concatenate(qs).astype(np.int32), np.concatenate(ts).astype(np.int32),
+            np.concatenate(ss).astype(np.float32), np.concatenate(rs).astype(np.float32))
+
+
+def search_reverse(D: Split, q_keep: np.ndarray, src: int, k: int, cfg: Config):
+    """Reverse blocking: every record of source `src` retrieves its top-k S1 records from an index of ALL
+    S1 rows (full cosine re-rank). Finds true pairs crowded out of the S1 side's top-k (many businesses
+    with the same name), and its rank says whether this S1 is the record's best owner. Only pairs whose
+    S1 is in `q_keep` are returned. Returns (q, t, full cosine, reverse rank)."""
+    t_rows = np.flatnonzero(D.src == src).astype(np.int32)
+    split_col = int(D.bounds[D.n_name_seg])
+    B = D.M[:D.n1]
+    df = np.bincount(B.indices, minlength=B.shape[1])
+    B.data[df[B.indices] > cfg.max_posting] = 0
+    B.eliminate_zeros()
+    dfp = np.bincount(B.indices, minlength=B.shape[1]).astype(np.int64)
+    BT = B.T.tocsr()
+    del B
+    pool = max(k, cfg.rev_pool)
+    t0 = time.time()
+    qs, ts, ss, rs = [], [], [], []
+    for s0 in range(0, len(t_rows), cfg.query_chunk):
+        tq = t_rows[s0:s0 + cfg.query_chunk]
+        r, c = _retrieve(D.M[D.n1 + tq], BT, dfp, pool, cfg)
+        tt, qq = tq[r], c.astype(np.int32)
+        nm, ad = rowwise_dot_parts(D.M, qq, D.n1 + tt, split_col)
+        full = nm + ad
+        rk, _ = _ranks(tt.astype(np.int64), full)
+        m = (rk <= k) & (full > 0) & q_keep[qq]
+        qs.append(qq[m]); ts.append(tt[m]); ss.append(full[m]); rs.append(rk[m])
+    del BT
+    log(f"  S{src + 2} [rev]: {len(t_rows):,} records -> top {k} of {D.n1:,} S1 (pool {pool}): {time.time() - t0:.0f}s")
     return (np.concatenate(qs).astype(np.int32), np.concatenate(ts).astype(np.int32),
             np.concatenate(ss).astype(np.float32), np.concatenate(rs).astype(np.float32))
 
@@ -624,6 +658,11 @@ def generate_candidates(D: Split, q_rows: np.ndarray, k: int, cfg: Config) -> pd
             if kk > 0:
                 runs.append(search_source(D, q_rows, src, kk, cfg, part) + (part,))
                 gc.collect()
+        if cfg.k_rev_pass > 0:
+            q_keep = np.zeros(D.n1, bool)
+            q_keep[q_rows] = True
+            runs.append(search_reverse(D, q_keep, src, cfg.k_rev_pass, cfg) + ("rev",))
+            gc.collect()
         U = _union_passes(runs, D.nT)
         del runs
         parts.append(pd.DataFrame({"src": np.int8(src), **U}))
@@ -638,12 +677,13 @@ def generate_candidates(D: Split, q_rows: np.ndarray, k: int, cfg: Config) -> pd
 
 def truncate_k(C: pd.DataFrame, k: int) -> pd.DataFrame:
     """Keep the top k of the combined pass; candidates of the extra passes are kept as they are."""
-    keep = (C["pass_rank_all"] <= k) | C["pass_rank_name"].notna() | C["pass_rank_addr"].notna()
+    keep = ((C["pass_rank_all"] <= k) | C["pass_rank_name"].notna() | C["pass_rank_addr"].notna()
+            | C["pass_rank_rev"].notna())
     C = C[keep.to_numpy()].drop(columns=["rank_in_source", "rank_overall", "gap_to_best",
                                          "ratio_to_best", "n_cand_s1"]).reset_index(drop=True)
     C.loc[C["pass_rank_all"] > k, "pass_rank_all"] = np.nan
     C["pass"] = ((C["pass_rank_all"].notna().to_numpy() * 1) | (C["pass_rank_name"].notna().to_numpy() * 2)
-                 | (C["pass_rank_addr"].notna().to_numpy() * 4)).astype(np.int8)
+                 | (C["pass_rank_addr"].notna().to_numpy() * 4) | (C["pass_rank_rev"].notna().to_numpy() * 8)).astype(np.int8)
     return add_group_features(C)
 
 
@@ -669,7 +709,8 @@ def choose_k(C: pd.DataFrame, D: Split, q_rows: np.ndarray, cfg: Config) -> int:
     log("  recall@K: " + "  ".join(f"{k}:{r:.4f}" for k, r in curve.items() if k in (1, 2, 3, 5, 8, 10, 15, 20) or k == cfg.k_max_per_source))
     log(f"  chosen K per source = {k} (recall {curve[k]:.4f} vs {top:.4f} at K={cfg.k_max_per_source})")
     lab = C["label"].to_numpy() == 1
-    extra = C["pass_rank_name"].notna().to_numpy() | C["pass_rank_addr"].notna().to_numpy()
+    extra = (C["pass_rank_name"].notna().to_numpy() | C["pass_rank_addr"].notna().to_numpy()
+             | C["pass_rank_rev"].notna().to_numpy())
     log(f"  union recall with extra passes (K={k}): "
         f"{((lab & ((C['pass_rank_all'].to_numpy() <= k) | extra)).sum()) / max(total, 1):.4f}")
     return k
@@ -707,7 +748,7 @@ BASE_FEATURES = [
     "name_token_sort", "name_core_ratio", "first_token_match", "addr_token_set",
     "postal_match", "house_match", "name_len_s1", "name_len_t", "addr_len_s1", "addr_len_t",
     "is_s3", "rank_in_source", "rank_overall", "gap_to_best", "ratio_to_best", "n_cand_s1",
-    "pass_rank_all", "pass_rank_name", "pass_rank_addr", "name_skel_jaccard",
+    "pass_rank_all", "pass_rank_name", "pass_rank_addr", "name_skel_jaccard", "pass_rank_rev",
 ]
 SLOW_FEATURES = ["name_token_set", "name_partial", "addr_levenshtein_ratio"]
 CROSS_FEATURES = ["cross_max_full", "cross_mean_full", "cross_max_name", "cross_max_addr", "cross_cnt_05",
@@ -917,7 +958,7 @@ def pair_features(D: Split, C: pd.DataFrame, cfg: Config, stage: int = 1) -> pd.
     del a1, a2
     F["is_s3"] = C["src"].to_numpy().astype(np.float32)
     for c in ("block_score", "rank_in_source", "rank_overall", "gap_to_best", "ratio_to_best", "n_cand_s1",
-              "pass_rank_all", "pass_rank_name", "pass_rank_addr"):
+              "pass_rank_all", "pass_rank_name", "pass_rank_addr", "pass_rank_rev"):
         F[c] = C[c].to_numpy().astype(np.float32)
     if cfg.cross_features:
         F.update(cross_features(D, q, t, cfg, wk))

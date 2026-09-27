@@ -21,6 +21,9 @@ if __name__ == "__main__":
     p.add_argument("--k-name-pass", type=int, default=0, help="extra name-only retrieval pass, top-k per source (0 = off)")
     p.add_argument("--k-addr-pass", type=int, default=0, help="extra address-only retrieval pass, top-k per source (0 = off)")
     p.add_argument("--extra-pool", type=int, default=100, help="retrieval pool of the extra passes")
+    p.add_argument("--k-rev-pass", type=int, default=0, help="reverse pass: each S2/S3 record retrieves its top-k S1 (0 = off)")
+    p.add_argument("--rev-pool", type=int, default=30, help="retrieval pool of the reverse pass")
+    p.add_argument("--leaves", type=int, default=127, help="LightGBM num_leaves")
     p.add_argument("--indic-translit", action="store_true", help="romanise Indic-script names/addresses")
     p.add_argument("--name-skeleton", action="store_true", help="add phonetic-skeleton keys to the name block")
     p.add_argument("--name-clean", action="store_true", help="names: leet digits -> letters, drop web tokens")
@@ -38,11 +41,11 @@ if __name__ == "__main__":
                  train_query_sample=a.train_queries or None, k_per_source=a.k, k_max_per_source=a.k_max,
                  max_posting=a.max_posting, rerank_pool=a.pool, fast_features=a.fast_features, fixed_threshold=a.threshold,
                  one_to_one=a.one_to_one, seed=a.seed, k_name_pass=a.k_name_pass, k_addr_pass=a.k_addr_pass,
-                 extra_pool=a.extra_pool, indic_translit=a.indic_translit, name_skeleton=a.name_skeleton,
+                 extra_pool=a.extra_pool, k_rev_pass=a.k_rev_pass, rev_pool=a.rev_pool, indic_translit=a.indic_translit, name_skeleton=a.name_skeleton,
                  name_clean=a.name_clean, cross_features=a.cross_features, skip_test=a.skip_test,
                  two_stage=a.two_stage, house_fuzzy=a.house_fuzzy, target_features=a.target_features)
     cfg.num_boost_round, cfg.max_train_rows = a.rounds, a.max_train_rows
-    cfg.lgb_params = dict(cfg.lgb_params, learning_rate=a.lr)
+    cfg.lgb_params = dict(cfg.lgb_params, learning_rate=a.lr, num_leaves=a.leaves)
     if a.threads:
         cfg.n_threads = a.threads
     run(cfg)

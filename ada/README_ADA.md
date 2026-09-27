@@ -32,7 +32,9 @@ If `sbatch` rejects the job, open `ada/run_d3.sbatch` and uncomment the `-A` (ac
 `-p` (partition) or `--gres=gpu:1` lines as your cluster requires.
 
 Presets:
-- `RUN=D4 PRESET=d4 sbatch ada/run_d3.sbatch`: **recommended**. D3 plus blocking of *all* training S1
+- `RUN=D5 PRESET=d5 sbatch ada/run_d3.sbatch`: **max-accuracy**. D4 plus a reverse pass (each S2/S3 record
+  retrieves its top-3 S1 out of all S1) and 255 leaves. About 3–4 h, ~55 GB RAM.
+- `RUN=D4 PRESET=d4 sbatch ada/run_d3.sbatch`: D3 plus blocking of *all* training S1
   entities (as at test) plus target-side competition features. Needs about 50 GB RAM and 2.5–3 h.
 - `RUN=D3 PRESET=d3 sbatch ada/run_d3.sbatch`: two-stage model and house-number match (about 2–2.5 h).
 - `d4s` / `d3s`: the same with 250k training queries (faster). `d2` reproduces D2.

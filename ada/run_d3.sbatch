@@ -4,7 +4,7 @@
 #SBATCH -J er_d3
 #SBATCH -c 40
 #SBATCH --mem=60G
-#SBATCH -t 06:00:00
+#SBATCH -t 07:00:00
 #SBATCH -o logs/slurm_%x_%j.log
 ## Uncomment / edit if your cluster requires them:
 ##SBATCH -A <your_account>
@@ -29,6 +29,8 @@ case "$PRESET" in
   d3s)  FLAGS="$COMMON --train-queries 250000 --k-addr-pass 15 --house-fuzzy --two-stage --rounds 3000" ;;  # smaller / faster d3
   d4)   FLAGS="$COMMON --train-queries 400000 --k-addr-pass 20 --house-fuzzy --two-stage --target-features --rounds 3000 --max-train-rows 6000000" ;;
   d4s)  FLAGS="$COMMON --train-queries 250000 --k-addr-pass 15 --house-fuzzy --two-stage --target-features --rounds 3000" ;;
+  d5)   FLAGS="$COMMON --train-queries 400000 --k-addr-pass 20 --k-rev-pass 3 --house-fuzzy --two-stage --target-features --rounds 3000 --leaves 255 --max-train-rows 6000000" ;;
+  d5s)  FLAGS="$COMMON --train-queries 250000 --k-addr-pass 15 --k-rev-pass 3 --house-fuzzy --two-stage --target-features --rounds 3000 --leaves 255" ;;
   *)    echo "unknown PRESET $PRESET"; exit 1 ;;
 esac
 
