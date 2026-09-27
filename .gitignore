@@ -10,7 +10,6 @@ output/
 CLAUDE_TASKS.md
 logs_C.log
 Code for business entity resolution
-code/business_entity_resolution/src/decide.py
 d.txt
 diagnose.py
 diagnose.txt

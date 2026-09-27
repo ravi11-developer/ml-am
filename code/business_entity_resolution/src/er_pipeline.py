@@ -71,6 +71,9 @@ class Config:
     cross_features: bool = False      # similarity of each candidate to the entity's other top candidates (anchors)
     n_anchors: int = 5
     skip_test: bool = False           # stop after training / validation (quick model checks)
+    two_stage: bool = False           # stage-2 model on top of out-of-fold stage-1 probabilities (entity context)
+    oof_folds: int = 2
+    house_fuzzy: bool = False         # house-number agreement tolerant to truncation / zero padding
 
     # ---- training ----
     train_query_sample: int | None = 200_000   # S1 train entities used as queries (None = all)
@@ -364,6 +367,14 @@ def build_field(raw: pa.Array, n: int, kind: str, cfg: Config | None = None) -> 
         first_codes = np.full(n, -1, np.int32)
         first_codes[has] = codes[off[:-1][has]]
         out["house"] = np.where((first_codes >= 0) & is_house[np.maximum(first_codes, 0)], first_codes, -1)
+        num_val = np.array([int(m.group()[:9]) if (m := re.match(r"\d+", v)) else -1 for v in vocab], np.int64)
+        idx = np.flatnonzero(num_val[codes] >= 0)
+        hn = np.full(n, -1, np.int64)
+        if len(idx):
+            rows = par[idx]
+            firsts = np.r_[True, rows[1:] != rows[:-1]]
+            hn[rows[firsts]] = num_val[codes[idx[firsts]]]
+        out["house_num"] = hn
     return out
 
 
@@ -419,6 +430,7 @@ def prepare_split(cfg: Config, split: str) -> Split:
               np.column_stack(nf["cnts"] + af["cnts"]),
               nf["text"], nf["core"], af["text"], nf["len"], af["len"], country,
               af["postal"], af["house"], nf["first"], labels, len(nf["seg_sizes"]))
+    D.house_num = af["house_num"]
     gt_path = d / f"{split}_ground_truth.tsv"
     if gt_path.exists():
         g = read_tsv(gt_path)
@@ -699,32 +711,75 @@ BASE_FEATURES = [
 SLOW_FEATURES = ["name_token_set", "name_partial", "addr_levenshtein_ratio"]
 CROSS_FEATURES = ["cross_max_full", "cross_mean_full", "cross_max_name", "cross_max_addr", "cross_cnt_05",
                   "cross_is_anchor", "cross_top_name_set", "cross_top_addr_set"]
+HOUSE_FEATURES = ["house_fuzzy", "house_logdiff"]
+P1_COLS = ["p1", "p1_rank", "p1_rank_src", "p1_max_other", "p1_second", "p1_sum_other", "p1_cnt05_other",
+           "p1_cnt05_other_src", "p1_ratio_best", "p1_gap_best"]
+STAGE2_FEATURES = P1_COLS + ["pc_max_full", "pc_wmean_full", "pc_max_name", "pc_max_addr", "pc_cnt_05",
+                             "pc_is_anchor", "pc_top_name_set", "pc_top_addr_set"]
 
 
-def feature_names(cfg: Config) -> list:
+def feature_names(cfg: Config, stage: int = 1) -> list:
     return (BASE_FEATURES + ([] if cfg.fast_features else SLOW_FEATURES)
-            + (CROSS_FEATURES if cfg.cross_features else []))
+            + (CROSS_FEATURES if cfg.cross_features else []) + (HOUSE_FEATURES if cfg.house_fuzzy else [])
+            + (STAGE2_FEATURES if stage == 2 else []))
 
 
-def compute_anchors(C: pd.DataFrame, n1: int, n_anchors: int) -> np.ndarray:
-    """(n1, n_anchors) target rows of each S1's best candidates by block score (-1 = none). Must be
-    computed on the full candidate set (before any negative sampling) so train and test agree."""
-    q, t, sc = C["q"].to_numpy(), C["t"].to_numpy(), C["block_score"].to_numpy()
+def compute_anchors(C: pd.DataFrame, n1: int, n_anchors: int, score=None, with_scores: bool = False):
+    """(n1, n_anchors) target rows of each S1's best candidates by `score` (default block score;
+    -1 = none). Must be computed on the full candidate set (before any negative sampling) so train
+    and test agree. with_scores=True also returns the anchors' scores."""
+    q, t = C["q"].to_numpy(), C["t"].to_numpy()
+    sc = C["block_score"].to_numpy() if score is None else score
     order = np.lexsort((-sc, q))
     qs = q[order]
     start = np.r_[True, qs[1:] != qs[:-1]]
     gstart = np.maximum.accumulate(np.where(start, np.arange(len(qs)), 0))
     rank = np.arange(len(qs)) - gstart
     A = np.full((n1, n_anchors), -1, np.int32)
+    S = np.zeros((n1, n_anchors), np.float32)
     m = rank < n_anchors
     A[qs[m], rank[m]] = t[order][m]
-    return A
+    S[qs[m], rank[m]] = sc[order][m]
+    return (A, S) if with_scores else A
 
 
-def cross_features(D: Split, q: np.ndarray, t: np.ndarray, cfg: Config, wk: int) -> dict:
+def add_p1_features(C: pd.DataFrame, p1: np.ndarray) -> pd.DataFrame:
+    """Entity-level context of stage-1 probabilities (vectorised over the full candidate set)."""
+    q = C["q"].to_numpy().astype(np.int64)
+    src = C["src"].to_numpy().astype(np.int64)
+    p1 = p1.astype(np.float32)
+    C["p1"] = p1
+    C["p1_rank"], best = _ranks(q, p1)
+    C["p1_rank_src"], _ = _ranks(q * 2 + src, p1)
+    order = np.lexsort((-p1, q))
+    qs, ps = q[order], p1[order]
+    start = np.r_[True, qs[1:] != qs[:-1]]
+    gs = np.maximum.accumulate(np.where(start, np.arange(len(qs)), 0))
+    size = np.bincount(q, minlength=q.max() + 1 if len(q) else 1)
+    has2 = size[qs] > 1
+    sec_sorted = np.where(has2, ps[np.minimum(gs + 1, len(ps) - 1)], 0.0)
+    second = np.empty(len(q), np.float32)
+    second[order] = sec_sorted
+    C["p1_second"] = second
+    C["p1_max_other"] = np.where(C["p1_rank"].to_numpy() == 1, second, best).astype(np.float32)
+    tot = np.bincount(q, weights=p1)[q]
+    C["p1_sum_other"] = (tot - p1).astype(np.float32)
+    hi = (p1 > 0.5).astype(np.float64)
+    C["p1_cnt05_other"] = (np.bincount(q, weights=hi)[q] - hi).astype(np.float32)
+    key_other = q * 2 + (1 - src)
+    cnt_qs = np.bincount(q * 2 + src, weights=hi, minlength=int(key_other.max()) + 1 if len(q) else 1)
+    C["p1_cnt05_other_src"] = cnt_qs[key_other].astype(np.float32)
+    C["p1_ratio_best"] = np.where(best > 0, p1 / np.maximum(best, 1e-9), np.nan).astype(np.float32)
+    C["p1_gap_best"] = (best - p1).astype(np.float32)
+    return C
+
+
+def cross_features(D: Split, q: np.ndarray, t: np.ndarray, cfg: Config, wk: int,
+                   anchors=None, prefix: str = "cross_", anchor_w=None) -> dict:
     """Agreement of candidate t with the other top candidates of the same S1 (S2/S3 copies of one
-    business tend to agree with each other even when the S1 record is noisy)."""
-    A = D.anchors[q]
+    business tend to agree with each other even when the S1 record is noisy). With anchor_w (the
+    anchors' stage-1 probabilities) a probability-weighted mean is returned instead of the plain mean."""
+    A = (D.anchors if anchors is None else anchors)[q]
     m, k = A.shape
     full = np.full((m, k), np.nan, np.float32)
     nmx = np.full((m, k), np.nan, np.float32)
@@ -741,12 +796,16 @@ def cross_features(D: Split, q: np.ndarray, t: np.ndarray, cfg: Config, wk: int)
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            F["cross_max_full"] = np.nanmax(full, 1)
-            F["cross_mean_full"] = np.nanmean(full, 1)
-            F["cross_max_name"] = np.nanmax(nmx, 1)
-            F["cross_max_addr"] = np.nanmax(adx, 1)
-    F["cross_cnt_05"] = (np.nan_to_num(full) > 0.5).sum(1).astype(np.float32)
-    F["cross_is_anchor"] = (A == t[:, None]).any(1).astype(np.float32)
+            F["max_full"] = np.nanmax(full, 1)
+            if anchor_w is None:
+                F["mean_full"] = np.nanmean(full, 1)
+            else:
+                W = np.where(np.isnan(full), 0.0, anchor_w[q])
+                F["wmean_full"] = (np.nan_to_num(full) * W).sum(1) / np.maximum(W.sum(1), 1e-6)
+            F["max_name"] = np.nanmax(nmx, 1)
+            F["max_addr"] = np.nanmax(adx, 1)
+    F["cnt_05"] = (np.nan_to_num(full) > 0.5).sum(1).astype(np.float32)
+    F["is_anchor"] = (A == t[:, None]).any(1).astype(np.float32)
     # string similarity to the best other anchor
     best = np.where(A[:, 0] != t, A[:, 0], A[:, 1] if k > 1 else -1)
     has = best >= 0
@@ -755,8 +814,8 @@ def cross_features(D: Split, q: np.ndarray, t: np.ndarray, cfg: Config, wk: int)
         it, ia = pa.array(D.n1 + t[has]), pa.array(D.n1 + best[has])
         tn[has] = _cp(D.name_text.take(it).to_pylist(), D.name_text.take(ia).to_pylist(), fuzz.token_set_ratio, wk)
         bn[has] = _cp(D.addr_text.take(it).to_pylist(), D.addr_text.take(ia).to_pylist(), fuzz.token_set_ratio, wk)
-    F["cross_top_name_set"], F["cross_top_addr_set"] = tn, bn
-    return {c: v.astype(np.float32) for c, v in F.items()}
+    F["top_name_set"], F["top_addr_set"] = tn, bn
+    return {prefix + c: np.asarray(v, np.float32) for c, v in F.items()}
 
 
 def _cp(a, b, scorer, workers):
@@ -773,7 +832,23 @@ def _agree(x, y):
     return out
 
 
-def pair_features(D: Split, C: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def house_fuzzy(h1: np.ndarray, h2: np.ndarray):
+    """2 = same number, 1 = one is a prefix / suffix of the other (truncation, e.g. 1344 vs 344),
+    0 = different, NaN = missing; plus log1p of the absolute difference."""
+    ok = (h1 >= 0) & (h2 >= 0)
+    a, b = np.maximum(h1, 0), np.maximum(h2, 0)
+    da = np.floor(np.log10(np.maximum(a, 1))).astype(np.int64) + 1
+    db = np.floor(np.log10(np.maximum(b, 1))).astype(np.int64) + 1
+    suf = (a % (10 ** db) == b) | (b % (10 ** da) == a)
+    pre = ((da > db) & (a // (10 ** np.maximum(da - db, 0)) == b)) | ((db > da) & (b // (10 ** np.maximum(db - da, 0)) == a))
+    f = np.where(a == b, 2.0, np.where(suf | pre, 1.0, 0.0)).astype(np.float32)
+    f[~ok] = np.nan
+    d = np.log1p(np.abs(a - b)).astype(np.float32)
+    d[~ok] = np.nan
+    return f, d
+
+
+def pair_features(D: Split, C: pd.DataFrame, cfg: Config, stage: int = 1) -> pd.DataFrame:
     q = C["q"].to_numpy(); t = C["t"].to_numpy(); ib = D.n1 + t; m = len(q)
     F = {}
     P = D.M[q].multiply(D.M[ib]).tocsr()
@@ -821,23 +896,29 @@ def pair_features(D: Split, C: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         F[c] = C[c].to_numpy().astype(np.float32)
     if cfg.cross_features:
         F.update(cross_features(D, q, t, cfg, wk))
-    return pd.DataFrame({c: F[c] for c in feature_names(cfg)})
+    if cfg.house_fuzzy:
+        F["house_fuzzy"], F["house_logdiff"] = house_fuzzy(D.house_num[q], D.house_num[ib])
+    if stage == 2:
+        for c in P1_COLS:
+            F[c] = C[c].to_numpy().astype(np.float32)
+        F.update(cross_features(D, q, t, cfg, wk, anchors=D.anchors_p, prefix="pc_", anchor_w=D.anchor_pw))
+    return pd.DataFrame({c: F[c] for c in feature_names(cfg, stage)})
 
 
-def features_batched(D: Split, C: pd.DataFrame, cfg: Config, booster=None, tag="") -> np.ndarray | pd.DataFrame:
+def features_batched(D: Split, C: pd.DataFrame, cfg: Config, booster=None, tag="", stage: int = 1) -> np.ndarray | pd.DataFrame:
     """Compute features in batches. With a booster, return probabilities only (never holds
     the full feature matrix in memory)."""
     out = []
     t0 = time.time()
     for s in range(0, len(C), cfg.feature_batch):
-        X = pair_features(D, C.iloc[s:s + cfg.feature_batch], cfg)
+        X = pair_features(D, C.iloc[s:s + cfg.feature_batch], cfg, stage)
         out.append(booster.predict(X.to_numpy(np.float32), num_threads=cfg.n_threads).astype(np.float32)
                    if booster is not None else X)
         if (s // cfg.feature_batch) % 5 == 0:
             log(f"  {tag} features {min(s + cfg.feature_batch, len(C)):,}/{len(C):,} ({time.time() - t0:.0f}s)")
     if booster is not None:
         return np.concatenate(out) if out else np.array([], np.float32)
-    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=feature_names(cfg))
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=feature_names(cfg, stage))
 
 
 # %% [markdown]
@@ -901,6 +982,40 @@ def train_and_tune(D: Split, cfg: Config) -> dict:
     log(f"  LightGBM best iteration {best_iter}")
 
     prob = booster.predict(Xva.to_numpy(np.float32), num_iteration=best_iter).astype(np.float32)
+    booster1 = None
+    if cfg.two_stage:
+        booster1 = booster
+        prob_s1 = prob.copy()
+        log("  building stage 2 (out-of-fold stage-1 probabilities)")
+        # out-of-fold stage-1 probabilities for ALL candidates of the training entities
+        Ctr_all = C[~is_val].reset_index(drop=True)
+        tr_q = np.unique(Ctr_all["q"].to_numpy())
+        fold_of = np.full(D.n1, -1, np.int8)
+        fold_of[tr_q] = rng.integers(0, cfg.oof_folds, len(tr_q))
+        f_all, f_smp = fold_of[Ctr_all["q"].to_numpy()], fold_of[Ctr["q"].to_numpy()]
+        p1_tr = np.empty(len(Ctr_all), np.float32)
+        ytr1 = Ctr["label"].to_numpy()
+        for f in range(cfg.oof_folds):
+            sel = f_smp != f
+            bf = train_lgb(Xtr[sel], ytr1[sel], None, None, cfg, rounds=best_iter)
+            idx = np.flatnonzero(f_all == f)
+            p1_tr[idx] = features_batched(D, Ctr_all.iloc[idx], cfg, booster=bf, tag=f"oof fold {f}")
+            del bf
+        C2 = pd.concat([Ctr_all, Cva], ignore_index=True)
+        C2 = add_p1_features(C2, np.r_[p1_tr, prob])
+        D.anchors_p, D.anchor_pw = compute_anchors(C2, D.n1, cfg.n_anchors, score=C2["p1"].to_numpy(), with_scores=True)
+        is_val2 = np.r_[np.zeros(len(Ctr_all), bool), np.ones(len(Cva), bool)]
+        Ctr = C2[~is_val2].reset_index(drop=True)
+        Cva = C2[is_val2].reset_index(drop=True)
+        del C2, Ctr_all
+        gc.collect()
+        Ctr = Ctr.iloc[sample_rows(Ctr, cfg, rng)].reset_index(drop=True)
+        Xtr = features_batched(D, Ctr, cfg, tag="train s2", stage=2)
+        Xva = features_batched(D, Cva, cfg, tag="val s2", stage=2)
+        booster = train_lgb(Xtr, Ctr["label"].to_numpy(), Xva, Cva["label"].to_numpy(), cfg)
+        best_iter = booster.best_iteration or cfg.num_boost_round
+        log(f"  stage-2 LightGBM best iteration {best_iter}")
+        prob = booster.predict(Xva.to_numpy(np.float32), num_iteration=best_iter).astype(np.float32)
     qi = np.searchsorted(val_q, Cva["q"].to_numpy()).astype(np.int64)
     gt_cnt = np.bincount(np.searchsorted(val_q, D.gt_q[np.isin(D.gt_q, val_q)]), minlength=len(val_q))
     y = Cva["label"].to_numpy().astype(bool)
@@ -911,6 +1026,12 @@ def train_and_tune(D: Split, cfg: Config) -> dict:
         keep = (prob >= thr) & (tb if oto else True)
         return macro_f05(len(val_q), qi[keep], y[keep], gt_cnt)
 
+    s1_best = None
+    if cfg.two_stage:
+        tb1 = target_best(Cva["t"].to_numpy(), prob_s1)
+        s1_best = max(macro_f05(len(val_q), qi[(prob_s1 >= x) & (tb1 if one else True)],
+                                y[(prob_s1 >= x) & (tb1 if one else True)], gt_cnt) for x in cfg.threshold_grid)
+        log(f"  stage-1 best val F0.5 (for comparison): {s1_best:.4f}")
     curve = pd.DataFrame({"threshold": cfg.threshold_grid, "val_f05": [score(x) for x in cfg.threshold_grid]})
     plateau = curve.loc[curve["val_f05"] >= curve["val_f05"].max() - 5e-4, "threshold"]
     thr = cfg.fixed_threshold if cfg.fixed_threshold is not None else float(plateau.iloc[len(plateau) // 2])
@@ -918,7 +1039,8 @@ def train_and_tune(D: Split, cfg: Config) -> dict:
               "val_entities": int(len(val_q)), "val_f05": score(thr), "val_f05_at_0.75": score(0.75),
               "val_f05_at_0.80": score(0.80), "val_f05_no_one_to_one": score(thr, False),
               "val_f05_blocking_ceiling": macro_f05(len(val_q), qi[y], y[y], gt_cnt),
-              "val_f05_predict_nothing": macro_f05(len(val_q), qi[:0], y[:0], gt_cnt), "profile": st}
+              "val_f05_predict_nothing": macro_f05(len(val_q), qi[:0], y[:0], gt_cnt),
+              "val_f05_stage1_best": s1_best, "profile": st}
     for kk, v in report.items():
         if kk != "profile":
             log(f"  {kk}: {v:.4f}" if isinstance(v, float) else f"  {kk}: {v}")
@@ -929,7 +1051,7 @@ def train_and_tune(D: Split, cfg: Config) -> dict:
     yall = np.r_[Ctr["label"].to_numpy(), y[vi].astype(np.int8)]
     final = train_lgb(Xall, yall, None, None, cfg, rounds=max(50, int(best_iter * 1.1)))
     imp = pd.Series(final.feature_importance("gain"), index=final.feature_name()).sort_values(ascending=False)
-    return {"booster": final, "k": int(k), "threshold": float(thr), "one_to_one": bool(one),
+    return {"booster": final, "booster1": booster1, "k": int(k), "threshold": float(thr), "one_to_one": bool(one),
             "curve": curve, "report": report, "importance": imp,
             "val": Cva.assign(prob=prob, label=y.astype(np.int8)),
             "val_gt_cnt": np.c_[val_q, gt_cnt]}
@@ -993,7 +1115,14 @@ def predict_test(res: dict, cfg: Config) -> dict:
     C = generate_candidates(D, np.arange(D.n1, dtype=np.int32), res["k"], cfg)
     if cfg.cross_features:
         D.anchors = compute_anchors(C, D.n1, cfg.n_anchors)
-    prob = features_batched(D, C, cfg, booster=res["booster"], tag="test")
+    if cfg.two_stage:
+        p1 = features_batched(D, C, cfg, booster=res["booster1"], tag="test s1")
+        C = add_p1_features(C, p1)
+        del p1
+        D.anchors_p, D.anchor_pw = compute_anchors(C, D.n1, cfg.n_anchors, score=C["p1"].to_numpy(), with_scores=True)
+        prob = features_batched(D, C, cfg, booster=res["booster"], tag="test s2", stage=2)
+    else:
+        prob = features_batched(D, C, cfg, booster=res["booster"], tag="test")
     q, t = C["q"].to_numpy(), C["t"].to_numpy()
     cache = Path(cfg.model_dir) / "cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -1024,6 +1153,8 @@ def run(cfg: Config) -> dict:
     md = Path(cfg.model_dir)
     md.mkdir(parents=True, exist_ok=True)
     res["booster"].save_model(str(md / "lgbm_final.txt"))
+    if res.get("booster1") is not None:
+        res["booster1"].save_model(str(md / "lgbm_stage1.txt"))
     (md / "run_report.json").write_text(json.dumps({"config": asdict(cfg), "validation": res["report"]}, indent=2, default=str))
     res["curve"].to_csv(md / "threshold_curve.tsv", sep="\t", index=False)
     res["importance"].rename("gain").to_csv(md / "feature_importance.tsv", sep="\t")
