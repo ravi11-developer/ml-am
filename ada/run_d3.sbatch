@@ -23,14 +23,15 @@ THREADS=${SLURM_CPUS_PER_TASK:-40}
 SRC=code/business_entity_resolution/src
 
 BASE="--threads $THREADS --pool 150 --max-posting 10000 --k-max 20 --indic-translit --name-skeleton --name-clean"
+V2="--norm-v2"
 COMMON="$BASE --cross-features"
 # d6 = final: decoy-aware address numbers, same-name sibling counts, target-side competition over ALL S1,
 # reverse pass, test-like validation (threshold tuned with every S1 competing, like the leaderboard)
-D6="$BASE --train-queries 400000 --k-addr-pass 20 --k-rev-pass 3 --house-fuzzy --addr-numbers --sib-features --target-features --rounds 3000 --max-train-rows 6000000"
+D6="$BASE $V2 --train-queries 400000 --k-addr-pass 20 --k-rev-pass 3 --house-fuzzy --addr-numbers --sib-features --target-features --rounds 3000 --max-train-rows 6000000"
 case "$PRESET" in
   d6)   FLAGS="$D6" ;;
   d6x)  FLAGS="$D6 --cross-features" ;;
-  d6s)  FLAGS="$BASE --train-queries 250000 --k-addr-pass 15 --k-rev-pass 3 --house-fuzzy --addr-numbers --sib-features --target-features --rounds 3000" ;;
+  d6s)  FLAGS="$BASE $V2 --train-queries 250000 --k-addr-pass 15 --k-rev-pass 3 --house-fuzzy --addr-numbers --sib-features --target-features --rounds 3000" ;;
   d2)   FLAGS="$COMMON --train-queries 250000 --k-addr-pass 15" ;;                                   # = D2 (val 0.9537)
   d3)   FLAGS="$COMMON --train-queries 400000 --k-addr-pass 20 --house-fuzzy --two-stage --rounds 3000 --max-train-rows 6000000" ;;
   d3s)  FLAGS="$COMMON --train-queries 250000 --k-addr-pass 15 --house-fuzzy --two-stage --rounds 3000" ;;  # smaller / faster d3

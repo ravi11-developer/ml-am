@@ -79,6 +79,8 @@ class Config:
     target_features: bool = False     # block ALL train S1 (as at test) + target-side competition features
     addr_numbers: bool = False        # compare all address numbers (exact / truncated-padded / numeric gap -> decoys)
     sib_features: bool = False        # how many S1 entities share this S1's / this record's canonical name
+    norm_v2: bool = False             # dotted acronyms (S.A.R.L. -> sarl), French street abbreviations (r -> rue,
+                                      # st/saint), elisions, generator suffix variants removed from the core name
 
     # ---- training ----
     train_query_sample: int | None = 200_000   # S1 train entities used as queries (None = all)
@@ -219,6 +221,20 @@ def skeleton(w: str) -> str:
     return w if len(w) >= 2 else ""
 
 
+# address-only abbreviations (norm_v2). Copies abbreviate street types that S1 writes in full (French
+# "R" = rue in ~26% of S2/S3 French addresses); "Saint" and "St" are unified with street because the
+# generator also expands US "St" to "Saint" ("00709 Hackberry Saint").
+ADDR_ABBREV = {**ABBREV, "r": "rue", "imp": "impasse", "ch": "chemin", "chem": "chemin", "rte": "route",
+               "fg": "faubourg", "fbg": "faubourg", "saint": "street"}
+# core-name stop list (norm_v2): legal forms incl. French ones, articles / elisions, and the suffix variants
+# the generator adds to copies (Services / Center / Partners / Holding / Groupe / Participations ...).
+LEGAL_V2 = LEGAL | {
+    "ei", "sci", "cie", "ets", "etablissements", "societe", "selarl", "scop", "sca", "gie", "sas", "sasu",
+    "de", "du", "des", "la", "le", "les", "et", "l", "d", "au", "aux", "en",
+    "holding", "groupe", "group", "participations", "distribution", "developpement", "international",
+    "services", "service", "center", "centre", "partners", "enterprises", "associates", "commission",
+    "shri", "sri", "smt", "m", "s", "ms", "id", "inc", "ltd", "pvt", "corp", "co",
+}
 _POSTAL_RE = re.compile(r"\d{5,6}")
 _HOUSE_RE = re.compile(r"\d+[a-z]?")
 
@@ -244,10 +260,14 @@ def col(t: pa.Table, name: str) -> pa.Array:
     return pc.cast(t.column(name).combine_chunks(), pa.large_string())
 
 
-def normalize(a: pa.Array, is_addr: bool = False) -> pa.Array:
+def normalize(a: pa.Array, is_addr: bool = False, v2: bool = False) -> pa.Array:
     a = pc.utf8_normalize(a, "NFKD")
     a = pc.replace_substring_regex(a, r"\p{Mn}+", "")
     a = pc.utf8_lower(a)
+    if v2:   # join dotted acronyms before punctuation is stripped: s.a.r.l. -> sarl, p.l.l.c -> pllc, s.a. -> sa
+        a = pc.replace_substring_regex(a, r"\b([a-z])\. ?([a-z])\. ?([a-z])\. ?([a-z])\b\.?", r"\1\2\3\4")
+        a = pc.replace_substring_regex(a, r"\b([a-z])\. ?([a-z])\. ?([a-z])\b\.?", r"\1\2\3")
+        a = pc.replace_substring_regex(a, r"\b([a-z])\. ?([a-z])\b\.?", r"\1\2")
     a = pc.replace_substring(a, "&", " and ")
     a = pc.replace_substring_regex(a, r"[^\p{L}\p{N}]+", " ")
     if is_addr:
@@ -327,8 +347,12 @@ def build_field(raw: pa.Array, n: int, kind: str, cfg: Config | None = None) -> 
     cfg = cfg or Config()
     if cfg.indic_translit:
         raw = _translit_indic(raw)
-    norm = normalize(raw, is_addr=(kind == "addr"))
-    codes, par, vocab = _tokens(norm, _clean_name_token if (kind == "name" and cfg.name_clean) else ABBREV)
+    norm = normalize(raw, is_addr=(kind == "addr"), v2=cfg.norm_v2)
+    if kind == "name":
+        mapping = _clean_name_token if cfg.name_clean else ABBREV
+    else:
+        mapping = ADDR_ABBREV if cfg.norm_v2 else ABBREV
+    codes, par, vocab = _tokens(norm, mapping)
     V = len(vocab)
     vocab_arrow = pa.array(vocab.tolist(), pa.large_string())
     U = _csr_binary(codes, par, n, V)
@@ -353,7 +377,7 @@ def build_field(raw: pa.Array, n: int, kind: str, cfg: Config | None = None) -> 
     out["text"] = _rejoin(codes, par, vocab_arrow, n)
     out["len"] = pc.utf8_length(out["text"]).to_numpy(zero_copy_only=False).astype(np.int32)
     if kind == "name":
-        legal = np.isin(vocab, list(LEGAL))
+        legal = np.isin(vocab, list(LEGAL_V2 if cfg.norm_v2 else LEGAL))
         keep = ~legal[codes]
         cc, cp = codes[keep], par[keep]
         core = _rejoin(cc, cp, vocab_arrow, n)

@@ -36,6 +36,7 @@ if __name__ == "__main__":
     p.add_argument("--house-fuzzy", action="store_true", help="house-number match tolerant to truncation / padding")
     p.add_argument("--addr-numbers", action="store_true", help="compare all address numbers (decoys shift house numbers)")
     p.add_argument("--sib-features", action="store_true", help="count S1 entities sharing the canonical name")
+    p.add_argument("--norm-v2", action="store_true", help="acronyms, French street abbreviations, core-name variants")
     p.add_argument("--target-features", action="store_true",
                    help="block all train S1 (as at test) and add target-side competition features (needs ~50 GB RAM)")
     a = p.parse_args()
@@ -46,7 +47,7 @@ if __name__ == "__main__":
                  extra_pool=a.extra_pool, k_rev_pass=a.k_rev_pass, rev_pool=a.rev_pool, indic_translit=a.indic_translit, name_skeleton=a.name_skeleton,
                  name_clean=a.name_clean, cross_features=a.cross_features, skip_test=a.skip_test,
                  two_stage=a.two_stage, house_fuzzy=a.house_fuzzy, target_features=a.target_features,
-                 addr_numbers=a.addr_numbers, sib_features=a.sib_features)
+                 addr_numbers=a.addr_numbers, sib_features=a.sib_features, norm_v2=a.norm_v2)
     cfg.num_boost_round, cfg.max_train_rows = a.rounds, a.max_train_rows
     cfg.lgb_params = dict(cfg.lgb_params, learning_rate=a.lr, num_leaves=a.leaves)
     if a.threads:
