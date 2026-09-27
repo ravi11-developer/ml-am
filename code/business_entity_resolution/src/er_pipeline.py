@@ -74,6 +74,7 @@ class Config:
     two_stage: bool = False           # stage-2 model on top of out-of-fold stage-1 probabilities (entity context)
     oof_folds: int = 2
     house_fuzzy: bool = False         # house-number agreement tolerant to truncation / zero padding
+    target_features: bool = False     # block ALL train S1 (as at test) + target-side competition features
 
     # ---- training ----
     train_query_sample: int | None = 200_000   # S1 train entities used as queries (None = all)
@@ -712,6 +713,7 @@ SLOW_FEATURES = ["name_token_set", "name_partial", "addr_levenshtein_ratio"]
 CROSS_FEATURES = ["cross_max_full", "cross_mean_full", "cross_max_name", "cross_max_addr", "cross_cnt_05",
                   "cross_is_anchor", "cross_top_name_set", "cross_top_addr_set"]
 HOUSE_FEATURES = ["house_fuzzy", "house_logdiff"]
+TARGET_FEATURES = ["t_n_s1", "t_rank", "t_gap", "t_ratio", "t_margin"]
 P1_COLS = ["p1", "p1_rank", "p1_rank_src", "p1_max_other", "p1_second", "p1_sum_other", "p1_cnt05_other",
            "p1_cnt05_other_src", "p1_ratio_best", "p1_gap_best"]
 STAGE2_FEATURES = P1_COLS + ["pc_max_full", "pc_wmean_full", "pc_max_name", "pc_max_addr", "pc_cnt_05",
@@ -721,6 +723,7 @@ STAGE2_FEATURES = P1_COLS + ["pc_max_full", "pc_wmean_full", "pc_max_name", "pc_
 def feature_names(cfg: Config, stage: int = 1) -> list:
     return (BASE_FEATURES + ([] if cfg.fast_features else SLOW_FEATURES)
             + (CROSS_FEATURES if cfg.cross_features else []) + (HOUSE_FEATURES if cfg.house_fuzzy else [])
+            + (TARGET_FEATURES if cfg.target_features else [])
             + (STAGE2_FEATURES if stage == 2 else []))
 
 
@@ -741,6 +744,28 @@ def compute_anchors(C: pd.DataFrame, n1: int, n_anchors: int, score=None, with_s
     A[qs[m], rank[m]] = t[order][m]
     S[qs[m], rank[m]] = sc[order][m]
     return (A, S) if with_scores else A
+
+
+def add_target_features(C: pd.DataFrame) -> pd.DataFrame:
+    """Target-side competition: how this S1 compares with every other S1 that retrieved the same
+    S2/S3 record. Needs candidates for ALL S1 entities (true at test; --target-features at train)."""
+    t = C["t"].to_numpy().astype(np.int64)
+    sc = C["block_score"].to_numpy().astype(np.float32)
+    rank, best = _ranks(t, sc)
+    order = np.lexsort((-sc, t))
+    ts, ss = t[order], sc[order]
+    start = np.r_[True, ts[1:] != ts[:-1]]
+    gs = np.maximum.accumulate(np.where(start, np.arange(len(ts)), 0))
+    cnt = np.bincount(t)
+    sec_sorted = np.where(cnt[ts] > 1, ss[np.minimum(gs + 1, len(ss) - 1)], 0.0)
+    second = np.empty(len(t), np.float32)
+    second[order] = sec_sorted
+    C["t_n_s1"] = cnt[t].astype(np.float32)
+    C["t_rank"] = rank
+    C["t_gap"] = (best - sc).astype(np.float32)
+    C["t_ratio"] = np.where(best > 0, sc / np.maximum(best, 1e-9), np.nan).astype(np.float32)
+    C["t_margin"] = (sc - np.where(rank == 1, second, best)).astype(np.float32)
+    return C
 
 
 def add_p1_features(C: pd.DataFrame, p1: np.ndarray) -> pd.DataFrame:
@@ -898,6 +923,9 @@ def pair_features(D: Split, C: pd.DataFrame, cfg: Config, stage: int = 1) -> pd.
         F.update(cross_features(D, q, t, cfg, wk))
     if cfg.house_fuzzy:
         F["house_fuzzy"], F["house_logdiff"] = house_fuzzy(D.house_num[q], D.house_num[ib])
+    if cfg.target_features:
+        for c in TARGET_FEATURES:
+            F[c] = C[c].to_numpy().astype(np.float32)
     if stage == 2:
         for c in P1_COLS:
             F[c] = C[c].to_numpy().astype(np.float32)
@@ -963,10 +991,21 @@ def train_and_tune(D: Split, cfg: Config) -> dict:
     st = profile(D)
     n_q = D.n1 if cfg.train_query_sample is None else min(D.n1, cfg.train_query_sample)
     q_rows = np.sort(rng.choice(D.n1, n_q, replace=False)).astype(np.int32)
-    C = generate_candidates(D, q_rows, cfg.k_max_per_source, cfg)
+    if cfg.target_features:   # block every S1, exactly like the test set, so target-side features agree
+        C = generate_candidates(D, np.arange(D.n1, dtype=np.int32), cfg.k_max_per_source, cfg)
+    else:
+        C = generate_candidates(D, q_rows, cfg.k_max_per_source, cfg)
     C["label"] = label_pairs(D, C["q"].to_numpy(), C["t"].to_numpy())
-    k = cfg.k_per_source or choose_k(C, D, q_rows, cfg)
+    if cfg.k_per_source:
+        k = cfg.k_per_source
+    else:
+        k = choose_k(C[np.isin(C["q"].to_numpy(), q_rows)] if cfg.target_features else C, D, q_rows, cfg)
     C = truncate_k(C, k)
+    if cfg.target_features:
+        C = add_target_features(C)
+        C = C[np.isin(C["q"].to_numpy(), q_rows)].reset_index(drop=True)
+        gc.collect()
+        log(f"  target-side features computed on all S1; kept {len(C):,} candidates of the {len(q_rows):,} sampled S1")
     C["label"] = label_pairs(D, C["q"].to_numpy(), C["t"].to_numpy())
     if cfg.cross_features:
         D.anchors = compute_anchors(C, D.n1, cfg.n_anchors)
@@ -1113,6 +1152,8 @@ def validate_outputs(match_path: Path, cand_path: Path, D: Split) -> bool:
 def predict_test(res: dict, cfg: Config) -> dict:
     D = prepare_split(cfg, "test")
     C = generate_candidates(D, np.arange(D.n1, dtype=np.int32), res["k"], cfg)
+    if cfg.target_features:
+        C = add_target_features(C)
     if cfg.cross_features:
         D.anchors = compute_anchors(C, D.n1, cfg.n_anchors)
     if cfg.two_stage:

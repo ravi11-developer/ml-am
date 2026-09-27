@@ -31,6 +31,8 @@ if __name__ == "__main__":
     p.add_argument("--max-train-rows", type=int, default=3_000_000, help="cap on sampled training pairs")
     p.add_argument("--two-stage", action="store_true", help="stage-2 model on out-of-fold stage-1 probabilities")
     p.add_argument("--house-fuzzy", action="store_true", help="house-number match tolerant to truncation / padding")
+    p.add_argument("--target-features", action="store_true",
+                   help="block all train S1 (as at test) and add target-side competition features (needs ~50 GB RAM)")
     a = p.parse_args()
     cfg = Config(data_dir=a.data_dir, output_dir=a.output_dir, model_dir=a.model_dir,
                  train_query_sample=a.train_queries or None, k_per_source=a.k, k_max_per_source=a.k_max,
@@ -38,7 +40,7 @@ if __name__ == "__main__":
                  one_to_one=a.one_to_one, seed=a.seed, k_name_pass=a.k_name_pass, k_addr_pass=a.k_addr_pass,
                  extra_pool=a.extra_pool, indic_translit=a.indic_translit, name_skeleton=a.name_skeleton,
                  name_clean=a.name_clean, cross_features=a.cross_features, skip_test=a.skip_test,
-                 two_stage=a.two_stage, house_fuzzy=a.house_fuzzy)
+                 two_stage=a.two_stage, house_fuzzy=a.house_fuzzy, target_features=a.target_features)
     cfg.num_boost_round, cfg.max_train_rows = a.rounds, a.max_train_rows
     cfg.lgb_params = dict(cfg.lgb_params, learning_rate=a.lr)
     if a.threads:

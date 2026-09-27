@@ -31,8 +31,13 @@ tail -f logs/slurm_er_d3_<jobid>.log         # live log; Ctrl+C stops watching, 
 If `sbatch` rejects the job, open `ada/run_d3.sbatch` and uncomment the `-A` (account),
 `-p` (partition) or `--gres=gpu:1` lines as your cluster requires.
 
-Presets: `PRESET=d3` (400k queries, full), `PRESET=d3s` (250k queries, faster), `PRESET=d2` (reproduces
-D2). Example: `RUN=D3s PRESET=d3s sbatch ada/run_d3.sbatch`.
+Presets:
+- `RUN=D4 PRESET=d4 sbatch ada/run_d3.sbatch`: **recommended**. D3 plus blocking of *all* training S1
+  entities (as at test) plus target-side competition features. Needs about 50 GB RAM and 2.5–3 h.
+- `RUN=D3 PRESET=d3 sbatch ada/run_d3.sbatch`: two-stage model and house-number match (about 2–2.5 h).
+- `d4s` / `d3s`: the same with 250k training queries (faster). `d2` reproduces D2.
+
+If the cluster lets you run two jobs at once, submit D4 and D3 together; D3 is the fallback.
 
 Useful log lines: `stage-1 best val F0.5` vs `val_f05` (the stage-2 gain), `[test] candidates`,
 `test s2 features`, `VALIDATION PASS`, `done`.

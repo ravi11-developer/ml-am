@@ -27,6 +27,8 @@ case "$PRESET" in
   d2)   FLAGS="$COMMON --train-queries 250000 --k-addr-pass 15" ;;                                   # = D2 (val 0.9537)
   d3)   FLAGS="$COMMON --train-queries 400000 --k-addr-pass 20 --house-fuzzy --two-stage --rounds 3000 --max-train-rows 6000000" ;;
   d3s)  FLAGS="$COMMON --train-queries 250000 --k-addr-pass 15 --house-fuzzy --two-stage --rounds 3000" ;;  # smaller / faster d3
+  d4)   FLAGS="$COMMON --train-queries 400000 --k-addr-pass 20 --house-fuzzy --two-stage --target-features --rounds 3000 --max-train-rows 6000000" ;;
+  d4s)  FLAGS="$COMMON --train-queries 250000 --k-addr-pass 15 --house-fuzzy --two-stage --target-features --rounds 3000" ;;
   *)    echo "unknown PRESET $PRESET"; exit 1 ;;
 esac
 
