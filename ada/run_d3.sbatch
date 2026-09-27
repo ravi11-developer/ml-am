@@ -1,7 +1,7 @@
 #!/bin/bash
 # Full run on the cluster. Submit from the repo root:   sbatch ada/run_d3.sbatch
 # Override the run name / preset:                         RUN=D3 PRESET=d3 sbatch ada/run_d3.sbatch
-#SBATCH -J er_d3
+#SBATCH -J er
 #SBATCH -c 40
 #SBATCH --mem=60G
 #SBATCH -t 07:00:00
@@ -17,8 +17,8 @@ mkdir -p logs output artifacts
 eval "$(conda shell.bash hook 2>/dev/null)" || source "$HOME/miniconda3/bin/activate"
 conda activate er
 
-RUN=${RUN:-D6}
-PRESET=${PRESET:-d6}
+RUN=${RUN:-D7}
+PRESET=${PRESET:-d7}
 THREADS=${SLURM_CPUS_PER_TASK:-40}
 SRC=code/business_entity_resolution/src
 
@@ -28,7 +28,11 @@ COMMON="$BASE --cross-features"
 # d6 = final: decoy-aware address numbers, same-name sibling counts, target-side competition over ALL S1,
 # reverse pass, test-like validation (threshold tuned with every S1 competing, like the leaderboard)
 D6="$BASE $V2 --train-queries 400000 --k-addr-pass 20 --k-rev-pass 3 --house-fuzzy --addr-numbers --sib-features --target-features --rounds 3000 --max-train-rows 6000000"
+# d7 = recommended: the feature set validated on real data (30k check: 0.9424 -> 0.9598) + reverse pass + 400k
+D7="$BASE $V2 --train-queries 400000 --k-addr-pass 20 --k-rev-pass 3 --house-fuzzy --addr-numbers --sib-features --rounds 3000 --max-train-rows 6000000"
 case "$PRESET" in
+  d7)   FLAGS="$D7" ;;
+  d7s)  FLAGS="$BASE $V2 --train-queries 250000 --k-addr-pass 15 --k-rev-pass 3 --house-fuzzy --addr-numbers --sib-features --rounds 3000" ;;
   d6)   FLAGS="$D6" ;;
   d6x)  FLAGS="$D6 --cross-features" ;;
   d6s)  FLAGS="$BASE $V2 --train-queries 250000 --k-addr-pass 15 --k-rev-pass 3 --house-fuzzy --addr-numbers --sib-features --target-features --rounds 3000" ;;

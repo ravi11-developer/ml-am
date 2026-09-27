@@ -63,6 +63,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--test-dir", default="dataset/test")
     ap.add_argument("--no-test", action="store_true")
+    ap.add_argument("--force", default=None, help="skip tuning and apply 'thr,margin,cap' (e.g. 0.84,0.1,99)")
     a = ap.parse_args()
     own = Path(f"artifacts/{a.run}/cache/testlike_pairs.parquet")      # written by the pipeline (--target-features)
     if own.exists():
@@ -76,7 +77,9 @@ def main():
     y = y.astype(bool)
     inE = np.isin(q, E)
     qi = np.searchsorted(E, q)
-    win, run2 = contest_stats(t, p)
+    win, run2 = contest_stats(t, p)          # over ALL competing S1
+    q, t, src, p, y, win, run2, qi = (x[inE] for x in (q, t, src, p, y, win, run2, qi))   # score only held-out S1
+    inE = np.ones(len(q), bool)
     rep = json.loads(Path(f"artifacts/{a.run}/run_report.json").read_text())["validation"]
 
     def f(keep):
@@ -92,6 +95,11 @@ def main():
         if v > best[0]:
             best = (v, (thr, margin, cap))
     log(f"best test-like F0.5 {best[0]:.4f} with (thr, margin, cap) = {best[1]}")
+    if a.force:
+        thr_, mg_, cap_ = (float(x) for x in a.force.split(","))
+        forced = (thr_, mg_, int(cap_))
+        best = (f(decide(q, t, src, p, *forced, win, run2)), forced)
+        log(f"forced rule {forced}: test-like F0.5 {best[0]:.4f}")
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     (out / "decision_testlike.json").write_text(json.dumps({"run_rule_f05": base, "best_f05": best[0],
                                                             "thr_margin_cap": best[1]}, indent=2))
