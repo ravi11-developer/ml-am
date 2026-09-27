@@ -79,6 +79,7 @@ class Config:
     target_features: bool = False     # block ALL train S1 (as at test) + target-side competition features
     addr_numbers: bool = False        # compare all address numbers (exact / truncated-padded / numeric gap -> decoys)
     sib_features: bool = False        # how many S1 entities share this S1's / this record's canonical name
+    miss_features: bool = False       # rarest name / address token one record has and the other lacks
     norm_v2: bool = False             # dotted acronyms (S.A.R.L. -> sarl), French street abbreviations (r -> rue,
                                       # st/saint), elisions, generator suffix variants removed from the core name
 
@@ -390,6 +391,7 @@ def build_field(raw: pa.Array, n: int, kind: str, cfg: Config | None = None) -> 
     else:
         is_postal = np.array([bool(_POSTAL_RE.fullmatch(v)) for v in vocab])
         is_house = np.array([bool(_HOUSE_RE.fullmatch(v)) for v in vocab])
+        out["num_vocab"] = is_house
         out["postal"] = _last_per_row(is_postal[codes], codes, par, n)
         off = _offsets(par, n)
         has = np.diff(off) > 0
@@ -472,6 +474,8 @@ def prepare_split(cfg: Config, split: str) -> Split:
               af["postal"], af["house"], nf["first"], labels, len(nf["seg_sizes"]))
     D.house_num = af["house_num"]
     D.nums = af["nums"]
+    D.numcol = np.zeros(M.shape[1], bool)
+    D.numcol[bounds[len(nf["seg_sizes"])]:bounds[len(nf["seg_sizes"])] + af["n_uni"]] = af["num_vocab"]
     if cfg.sib_features:   # canonical name = sorted unique core tokens; count S1 entities per name
         keys = [" ".join(sorted(set(x.split()))) for x in D.core_text.to_pylist()]
         kc, _ = pd.factorize(np.array(keys, dtype=object))
@@ -803,6 +807,8 @@ TARGET_FEATURES = ["t_n_s1", "t_rank", "t_gap", "t_ratio", "t_margin"]
 NUM_FEATURES = ["num_n_s1", "num_n_t", "num_exact_frac", "num_trunc_frac", "num_unmatched_s1", "num_first_exact",
                 "num_first_trunc", "num_min_gap", "num_first_min_gap"]
 SIB_FEATURES = ["sib_s1", "sib_t"]
+MISS_FEATURES = ["name_miss_s1_max", "name_miss_t_max", "name_miss_s1_mass", "addr_miss_s1_max", "addr_miss_t_max",
+                 "addr_miss_s1_mass", "addr_miss_t_mass"]
 P1_COLS = ["p1", "p1_rank", "p1_rank_src", "p1_max_other", "p1_second", "p1_sum_other", "p1_cnt05_other",
            "p1_cnt05_other_src", "p1_ratio_best", "p1_gap_best"]
 STAGE2_FEATURES = P1_COLS + ["pc_max_full", "pc_wmean_full", "pc_max_name", "pc_max_addr", "pc_cnt_05",
@@ -814,6 +820,7 @@ def feature_names(cfg: Config, stage: int = 1) -> list:
             + (CROSS_FEATURES if cfg.cross_features else []) + (HOUSE_FEATURES if cfg.house_fuzzy else [])
             + (TARGET_FEATURES if cfg.target_features else [])
             + (NUM_FEATURES if cfg.addr_numbers else []) + (SIB_FEATURES if cfg.sib_features else [])
+            + (MISS_FEATURES if cfg.miss_features else [])
             + (STAGE2_FEATURES if stage == 2 else []))
 
 
@@ -963,6 +970,22 @@ def house_fuzzy(h1: np.ndarray, h2: np.ndarray):
     return f, d
 
 
+def _missing_stats(Ma: sp.csr_matrix, Mb: sp.csr_matrix, lo: int, hi: int, scale: float, numcol: np.ndarray):
+    """For each row pair: max and squared mass of the TF-IDF weights of a's tokens (columns lo..hi, non-numeric)
+    that b does not contain. High max = a rare, distinctive token (street name, name word) is missing."""
+    m = Ma.shape[0]
+    Bb = Mb.copy(); Bb.data[:] = 1.0
+    R = (Ma - Ma.multiply(Bb)).tocsr()
+    R.eliminate_zeros()
+    rows = np.repeat(np.arange(m), np.diff(R.indptr))
+    sel = (R.indices >= lo) & (R.indices < hi) & ~numcol[R.indices]
+    w = np.abs(R.data[sel]) / scale
+    mx = np.zeros(m, np.float32)
+    np.maximum.at(mx, rows[sel], w.astype(np.float32))
+    mass = np.bincount(rows[sel], weights=w.astype(np.float64) ** 2, minlength=m).astype(np.float32)
+    return mx, mass
+
+
 def number_features(A: np.ndarray, B: np.ndarray) -> dict:
     """A, B: (m, 6) address numbers of S1 / record (-1 = none). True copies keep S1's numbers exactly or
     as strings (zero padding, one digit truncated); decoys shift them numerically (8 -> 9, 1331 -> 1332)."""
@@ -998,7 +1021,8 @@ def number_features(A: np.ndarray, B: np.ndarray) -> dict:
 def pair_features(D: Split, C: pd.DataFrame, cfg: Config, stage: int = 1) -> pd.DataFrame:
     q = C["q"].to_numpy(); t = C["t"].to_numpy(); ib = D.n1 + t; m = len(q)
     F = {}
-    P = D.M[q].multiply(D.M[ib]).tocsr()
+    Mq, Mt = D.M[q], D.M[ib]
+    P = Mq.multiply(Mt).tocsr()
     rows = np.repeat(np.arange(m), np.diff(P.indptr))
     ns, nn = len(D.bounds) - 1, D.n_name_seg
     seg = np.searchsorted(D.bounds, P.indices, side="right") - 1
@@ -1050,6 +1074,17 @@ def pair_features(D: Split, C: pd.DataFrame, cfg: Config, stage: int = 1) -> pd.
             F[c] = C[c].to_numpy().astype(np.float32)
     if cfg.addr_numbers:
         F.update(number_features(D.nums[q], D.nums[ib]))
+    if cfg.miss_features:
+        nn_ = D.n_name_seg
+        sn, sa = np.sqrt(cfg.name_weight), np.sqrt(1 - cfg.name_weight)
+        nlo, nhi, alo, ahi = int(D.bounds[0]), int(D.bounds[1]), int(D.bounds[nn_]), int(D.bounds[nn_ + 1])
+        F["name_miss_s1_max"], F["name_miss_s1_mass"] = _missing_stats(Mq, Mt, nlo, nhi, sn, D.numcol)
+        F["name_miss_t_max"], _ = _missing_stats(Mt, Mq, nlo, nhi, sn, D.numcol)
+        a1, m1 = _missing_stats(Mq, Mt, alo, ahi, sa, D.numcol)
+        a2, m2 = _missing_stats(Mt, Mq, alo, ahi, sa, D.numcol)
+        empty = (D.addr_len[q] == 0) | (D.addr_len[ib] == 0)
+        for k, v in (("addr_miss_s1_max", a1), ("addr_miss_s1_mass", m1), ("addr_miss_t_max", a2), ("addr_miss_t_mass", m2)):
+            v = v.copy(); v[empty] = np.nan; F[k] = v
     if cfg.sib_features:
         F["sib_s1"], F["sib_t"] = D.sib[q], D.sib[ib]
     if stage == 2:

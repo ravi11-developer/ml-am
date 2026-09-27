@@ -23,7 +23,7 @@ THREADS=${SLURM_CPUS_PER_TASK:-40}
 SRC=code/business_entity_resolution/src
 
 BASE="--threads $THREADS --pool 150 --max-posting 10000 --k-max 20 --indic-translit --name-skeleton --name-clean"
-V2="--norm-v2"
+V2="--norm-v2 --miss-features"
 COMMON="$BASE --cross-features"
 # d6 = final: decoy-aware address numbers, same-name sibling counts, target-side competition over ALL S1,
 # reverse pass, test-like validation (threshold tuned with every S1 competing, like the leaderboard)
