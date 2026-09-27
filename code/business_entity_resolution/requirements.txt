@@ -1,0 +1,11 @@
+pandas==3.0.2
+numpy==2.4.4
+scipy==1.17.1
+pyarrow==25.0.1
+rapidfuzz==3.14.6
+lightgbm==4.7.0
+sparse_dot_topn==1.2.0
+matplotlib==3.10.8
+# notebook only
+jupyter
+ipykernel
